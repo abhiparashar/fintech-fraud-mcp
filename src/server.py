@@ -10,13 +10,143 @@ DB_CONFIG = {
     "password": "password",
 }
 
+INDIAN_CITIES = (
+    'Mumbai', 'Delhi', 'Bangalore', 'Chennai',
+    'Hyderabad', 'Pune', 'Kolkata', 'Ahmedabad',
+    'Jaipur', 'Surat', 'Lucknow', 'Kanpur'
+)
+
+
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
+
+
+# ─── private query helpers ────────────────────────────────────────────────────
+
+def _fetch_duplicate_rows(cur, threshold_seconds: int = 60):
+    cur.execute("""
+        SELECT
+            a.user_id,
+            a.merchant,
+            a.amount,
+            a.txn_date    AS first_txn,
+            b.txn_date    AS second_txn,
+            EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int AS seconds_apart,
+            a.ip_address  AS ip_first,
+            b.ip_address  AS ip_second,
+            a.location    AS location_first,
+            b.location    AS location_second
+        FROM transactions a
+        JOIN transactions b
+            ON  a.user_id  = b.user_id
+            AND a.merchant = b.merchant
+            AND a.amount   = b.amount
+            AND a.txn_date < b.txn_date
+            AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) < %s
+        ORDER BY a.user_id, a.txn_date
+    """, (threshold_seconds,))
+    return cur.fetchall()
+
+
+def _fetch_location_anomaly_rows(cur, threshold_minutes: int = 30):
+    cur.execute("""
+        SELECT
+            a.user_id,
+            a.location                                              AS location_first,
+            b.location                                              AS location_second,
+            a.txn_date                                              AS time_first,
+            b.txn_date                                              AS time_second,
+            EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int / 60 AS minutes_apart,
+            a.merchant                                              AS merchant_first,
+            b.merchant                                              AS merchant_second,
+            a.amount                                                AS amount_first,
+            b.amount                                                AS amount_second,
+            a.ip_address                                            AS ip_first,
+            b.ip_address                                            AS ip_second
+        FROM transactions a
+        JOIN transactions b
+            ON  a.user_id  = b.user_id
+            AND a.txn_date < b.txn_date
+            AND a.location <> b.location
+            AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) / 60 < %s
+        WHERE
+            a.location = ANY(%s) AND b.location <> ALL(%s)
+        ORDER BY a.user_id, a.txn_date
+    """, (threshold_minutes, list(INDIAN_CITIES), list(INDIAN_CITIES)))
+    return cur.fetchall()
+
+
+def _fetch_late_night_rows(cur, start_hour: int = 2, end_hour: int = 4, multiplier: float = 3.0):
+    cur.execute("""
+        WITH user_averages AS (
+            SELECT
+                user_id,
+                ROUND(AVG(amount)::numeric, 2) AS avg_amount
+            FROM transactions
+            GROUP BY user_id
+        )
+        SELECT
+            t.user_id,
+            t.merchant,
+            t.amount,
+            ROUND(u.avg_amount::numeric, 2)              AS user_avg_amount,
+            ROUND((t.amount / u.avg_amount)::numeric, 1) AS times_above_avg,
+            t.txn_date,
+            t.location,
+            t.ip_address,
+            t.category
+        FROM transactions t
+        JOIN user_averages u ON t.user_id = u.user_id
+        WHERE
+            EXTRACT(HOUR FROM t.txn_date) >= %s
+            AND EXTRACT(HOUR FROM t.txn_date) < %s
+            AND t.amount > %s * u.avg_amount
+        ORDER BY t.amount DESC
+    """, (start_hour, end_hour, multiplier))
+    return cur.fetchall()
+
+
+def _fetch_rapid_fire_rows(cur, window_seconds: int = 90, min_txn_count: int = 5):
+    cur.execute("""
+        WITH burst_check AS (
+            SELECT
+                a.user_id,
+                a.txn_date,
+                a.merchant,
+                a.amount,
+                COUNT(b.*) AS nearby_count
+            FROM transactions a
+            JOIN transactions b
+                ON  a.user_id = b.user_id
+                AND b.txn_date BETWEEN
+                    a.txn_date - INTERVAL '1 second' * %s
+                    AND
+                    a.txn_date + INTERVAL '1 second' * %s
+            GROUP BY a.user_id, a.txn_date, a.merchant, a.amount
+            HAVING COUNT(b.*) >= %s
+        )
+        SELECT
+            user_id,
+            COUNT(*)                                                 AS flagged_txn_count,
+            MIN(txn_date)                                            AS burst_start,
+            MAX(txn_date)                                            AS burst_end,
+            EXTRACT(EPOCH FROM (MAX(txn_date) - MIN(txn_date)))::int AS duration_seconds,
+            SUM(amount)                                              AS total_amount,
+            STRING_AGG(DISTINCT merchant, ', ')                      AS merchants
+        FROM burst_check
+        GROUP BY user_id
+        ORDER BY flagged_txn_count DESC
+    """, (window_seconds, window_seconds, min_txn_count))
+    return cur.fetchall()
+
+
+# ─── MCP server ───────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     name="fintech-fraud-mcp",
     instructions="You are a fintech fraud detection assistant. Use the available tools to query transactions and identify anomalies.",
 )
+
 
 @mcp.tool()
 def get_schema() -> str:
@@ -75,29 +205,7 @@ def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    a.user_id,
-                    a.merchant,
-                    a.amount,
-                    a.txn_date    AS first_txn,
-                    b.txn_date    AS second_txn,
-                    EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int AS seconds_apart,
-                    a.ip_address  AS ip_first,
-                    b.ip_address  AS ip_second,
-                    a.location    AS location_first,
-                    b.location    AS location_second
-                FROM transactions a
-                JOIN transactions b
-                    ON  a.user_id  = b.user_id
-                    AND a.merchant = b.merchant
-                    AND a.amount   = b.amount
-                    AND a.txn_date < b.txn_date
-                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) < %s
-                ORDER BY a.user_id, a.txn_date
-            """, (threshold_seconds,))
-
-            rows = cur.fetchall()
+            rows = _fetch_duplicate_rows(cur, threshold_seconds)
             if not rows:
                 return "No duplicate transactions found."
 
@@ -110,17 +218,10 @@ def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
                     f"{row['first_txn']} → {row['second_txn']} | "
                     f"{row['seconds_apart']}s apart | {hint}"
                 )
-
             return f"Found {len(rows)} duplicate pair(s):\n\n" + "\n".join(result)
     finally:
         conn.close()
 
-
-INDIAN_CITIES = (
-    'Mumbai', 'Delhi', 'Bangalore', 'Chennai',
-    'Hyderabad', 'Pune', 'Kolkata', 'Ahmedabad',
-    'Jaipur', 'Surat', 'Lucknow', 'Kanpur'
-)
 
 @mcp.tool()
 def detect_location_anomalies(threshold_minutes: int = 30) -> str:
@@ -132,32 +233,7 @@ def detect_location_anomalies(threshold_minutes: int = 30) -> str:
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    a.user_id,
-                    a.location                                            AS location_first,
-                    b.location                                            AS location_second,
-                    a.txn_date                                            AS time_first,
-                    b.txn_date                                            AS time_second,
-                    EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int / 60 AS minutes_apart,
-                    a.merchant                                            AS merchant_first,
-                    b.merchant                                            AS merchant_second,
-                    a.amount                                              AS amount_first,
-                    b.amount                                              AS amount_second,
-                    a.ip_address                                          AS ip_first,
-                    b.ip_address                                          AS ip_second
-                FROM transactions a
-                JOIN transactions b
-                    ON  a.user_id  = b.user_id
-                    AND a.txn_date < b.txn_date
-                    AND a.location <> b.location
-                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) / 60 < %s
-                WHERE
-                    a.location = ANY(%s) AND b.location <> ALL(%s)
-                ORDER BY a.user_id, a.txn_date
-            """, (threshold_minutes, list(INDIAN_CITIES), list(INDIAN_CITIES)))
-
-            rows = cur.fetchall()
+            rows = _fetch_location_anomaly_rows(cur, threshold_minutes)
             if not rows:
                 return "No impossible location changes found."
 
@@ -170,7 +246,6 @@ def detect_location_anomalies(threshold_minutes: int = 30) -> str:
                     f"{row['minutes_apart']} min apart | "
                     f"IPs: {row['ip_first']} → {row['ip_second']}"
                 )
-
             return f"Found {len(rows)} impossible location change(s):\n\n" + "\n".join(result)
     finally:
         conn.close()
@@ -190,34 +265,7 @@ def detect_late_night_large_transactions(
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                WITH user_averages AS (
-                    SELECT
-                        user_id,
-                        ROUND(AVG(amount)::numeric, 2) AS avg_amount
-                    FROM transactions
-                    GROUP BY user_id
-                )
-                SELECT
-                    t.user_id,
-                    t.merchant,
-                    t.amount,
-                    ROUND(u.avg_amount::numeric, 2)          AS user_avg_amount,
-                    ROUND((t.amount / u.avg_amount)::numeric, 1) AS times_above_avg,
-                    t.txn_date,
-                    t.location,
-                    t.ip_address,
-                    t.category
-                FROM transactions t
-                JOIN user_averages u ON t.user_id = u.user_id
-                WHERE
-                    EXTRACT(HOUR FROM t.txn_date) >= %s
-                    AND EXTRACT(HOUR FROM t.txn_date) < %s
-                    AND t.amount > %s * u.avg_amount
-                ORDER BY t.amount DESC
-            """, (start_hour, end_hour, multiplier))
-
-            rows = cur.fetchall()
+            rows = _fetch_late_night_rows(cur, start_hour, end_hour, multiplier)
             if not rows:
                 return "No suspicious late night transactions found."
 
@@ -228,7 +276,6 @@ def detect_late_night_large_transactions(
                     f"{row['times_above_avg']}x their avg (₹{row['user_avg_amount']}) | "
                     f"{row['txn_date']} | {row['location']} | IP: {row['ip_address']}"
                 )
-
             return f"Found {len(rows)} suspicious late night transaction(s):\n\n" + "\n".join(result)
     finally:
         conn.close()
@@ -247,38 +294,7 @@ def detect_rapid_fire_transactions(
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                WITH burst_check AS (
-                    SELECT
-                        a.user_id,
-                        a.txn_date,
-                        a.merchant,
-                        a.amount,
-                        COUNT(b.*) AS nearby_count
-                    FROM transactions a
-                    JOIN transactions b
-                        ON  a.user_id = b.user_id
-                        AND b.txn_date BETWEEN
-                            a.txn_date - INTERVAL '1 second' * %s
-                            AND
-                            a.txn_date + INTERVAL '1 second' * %s
-                    GROUP BY a.user_id, a.txn_date, a.merchant, a.amount
-                    HAVING COUNT(b.*) >= %s
-                )
-                SELECT
-                    user_id,
-                    COUNT(*)                                                      AS flagged_txn_count,
-                    MIN(txn_date)                                                 AS burst_start,
-                    MAX(txn_date)                                                 AS burst_end,
-                    EXTRACT(EPOCH FROM (MAX(txn_date) - MIN(txn_date)))::int      AS duration_seconds,
-                    SUM(amount)                                                   AS total_amount,
-                    STRING_AGG(DISTINCT merchant, ', ')                           AS merchants
-                FROM burst_check
-                GROUP BY user_id
-                ORDER BY flagged_txn_count DESC
-            """, (window_seconds, window_seconds, min_txn_count))
-
-            rows = cur.fetchall()
+            rows = _fetch_rapid_fire_rows(cur, window_seconds, min_txn_count)
             if not rows:
                 return "No rapid fire transaction bursts found."
 
@@ -291,7 +307,6 @@ def detect_rapid_fire_transactions(
                     f"burst: {row['burst_start']} → {row['burst_end']} | "
                     f"merchants: {row['merchants']}"
                 )
-
             return f"Found {len(rows)} user(s) with rapid fire bursts:\n\n" + "\n".join(result)
     finally:
         conn.close()
@@ -307,7 +322,6 @@ def get_user_profile(user_id: int) -> str:
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-
             cur.execute("""
                 SELECT
                     COUNT(*)                                        AS total_transactions,
@@ -404,109 +418,48 @@ def get_fraud_summary() -> str:
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            dup_rows   = _fetch_duplicate_rows(cur)
+            loc_rows   = _fetch_location_anomaly_rows(cur)
+            late_rows  = _fetch_late_night_rows(cur)
+            rapid_rows = _fetch_rapid_fire_rows(cur)
 
-            # --- duplicate transactions ---
-            cur.execute("""
-                SELECT ARRAY_AGG(DISTINCT a.user_id) AS user_ids, COUNT(*) AS count
-                FROM transactions a
-                JOIN transactions b
-                    ON  a.user_id  = b.user_id
-                    AND a.merchant = b.merchant
-                    AND a.amount   = b.amount
-                    AND a.txn_date < b.txn_date
-                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) < 60
-            """)
-            dup = cur.fetchone()
-            dup_count = dup['count'] or 0
-            dup_users = set(dup['user_ids'] or [])
+        dup_users   = {row['user_id'] for row in dup_rows}
+        loc_users   = {row['user_id'] for row in loc_rows}
+        late_users  = {row['user_id'] for row in late_rows}
+        rapid_users = {row['user_id'] for row in rapid_rows}
 
-            # --- location anomalies ---
-            cur.execute("""
-                SELECT ARRAY_AGG(DISTINCT a.user_id) AS user_ids, COUNT(*) AS count
-                FROM transactions a
-                JOIN transactions b
-                    ON  a.user_id  = b.user_id
-                    AND a.txn_date < b.txn_date
-                    AND a.location <> b.location
-                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) / 60 < 30
-                WHERE a.location = ANY(%s) AND b.location <> ALL(%s)
-            """, (list(INDIAN_CITIES), list(INDIAN_CITIES)))
-            loc = cur.fetchone()
-            loc_count = loc['count'] or 0
-            loc_users = set(loc['user_ids'] or [])
+        all_flagged: dict[int, list[str]] = {}
+        for uid in dup_users:
+            all_flagged.setdefault(uid, []).append("duplicate charges")
+        for uid in loc_users:
+            all_flagged.setdefault(uid, []).append("impossible location")
+        for uid in late_users:
+            all_flagged.setdefault(uid, []).append("late night large spend")
+        for uid in rapid_users:
+            all_flagged.setdefault(uid, []).append("rapid fire")
 
-            # --- late night large transactions ---
-            cur.execute("""
-                WITH user_averages AS (
-                    SELECT user_id, AVG(amount) AS avg_amount
-                    FROM transactions GROUP BY user_id
-                )
-                SELECT ARRAY_AGG(DISTINCT t.user_id) AS user_ids, COUNT(*) AS count
-                FROM transactions t
-                JOIN user_averages u ON t.user_id = u.user_id
-                WHERE EXTRACT(HOUR FROM t.txn_date) >= 2
-                  AND EXTRACT(HOUR FROM t.txn_date) < 4
-                  AND t.amount > 3 * u.avg_amount
-            """)
-            late = cur.fetchone()
-            late_count = late['count'] or 0
-            late_users = set(late['user_ids'] or [])
+        high_risk = {uid: flags for uid, flags in all_flagged.items() if len(flags) >= 2}
 
-            # --- rapid fire ---
-            cur.execute("""
-                WITH burst_check AS (
-                    SELECT a.user_id
-                    FROM transactions a
-                    JOIN transactions b
-                        ON  a.user_id = b.user_id
-                        AND b.txn_date BETWEEN
-                            a.txn_date - INTERVAL '90 seconds'
-                            AND a.txn_date + INTERVAL '90 seconds'
-                    GROUP BY a.user_id, a.txn_date
-                    HAVING COUNT(b.*) >= 5
-                )
-                SELECT ARRAY_AGG(DISTINCT user_id) AS user_ids, COUNT(DISTINCT user_id) AS count
-                FROM burst_check
-            """)
-            rapid = cur.fetchone()
-            rapid_count = rapid['count'] or 0
-            rapid_users = set(rapid['user_ids'] or [])
+        report = [
+            "FRAUD SUMMARY REPORT",
+            "=" * 40,
+            f"Duplicate charge pairs     : {len(dup_rows)}   (users: {sorted(dup_users) or 'none'})",
+            f"Impossible location jumps  : {len(loc_rows)}   (users: {sorted(loc_users) or 'none'})",
+            f"Late night large spends    : {len(late_rows)}   (users: {sorted(late_users) or 'none'})",
+            f"Rapid fire bursts          : {len(rapid_rows)}   (users: {sorted(rapid_users) or 'none'})",
+            f"\nTotal flagged users        : {len(all_flagged)}",
+            "",
+            "HIGH RISK USERS (2+ fraud patterns)",
+            "-" * 40,
+        ]
 
-            # --- find high risk users (flagged by 2+ detectors) ---
-            all_flagged: dict[int, list[str]] = {}
-            for user_id in dup_users:
-                all_flagged.setdefault(user_id, []).append("duplicate charges")
-            for user_id in loc_users:
-                all_flagged.setdefault(user_id, []).append("impossible location")
-            for user_id in late_users:
-                all_flagged.setdefault(user_id, []).append("late night large spend")
-            for user_id in rapid_users:
-                all_flagged.setdefault(user_id, []).append("rapid fire")
+        if high_risk:
+            for uid, flags in sorted(high_risk.items()):
+                report.append(f"  user {uid} → {' + '.join(flags)}")
+        else:
+            report.append("  None found.")
 
-            high_risk = {uid: flags for uid, flags in all_flagged.items() if len(flags) >= 2}
-            total_flagged_users = len(all_flagged)
-
-            # --- build report ---
-            report = [
-                "FRAUD SUMMARY REPORT",
-                "=" * 40,
-                f"Duplicate charge pairs     : {dup_count}  (users: {sorted(dup_users) or 'none'})",
-                f"Impossible location jumps  : {loc_count}  (users: {sorted(loc_users) or 'none'})",
-                f"Late night large spends    : {late_count}  (users: {sorted(late_users) or 'none'})",
-                f"Rapid fire bursts          : {rapid_count}  (users: {sorted(rapid_users) or 'none'})",
-                f"\nTotal flagged users        : {total_flagged_users}",
-                "",
-                "HIGH RISK USERS (2+ fraud patterns)",
-                "-" * 40,
-            ]
-
-            if high_risk:
-                for uid, flags in sorted(high_risk.items()):
-                    report.append(f"  user {uid} → {' + '.join(flags)}")
-            else:
-                report.append("  None found.")
-
-            return "\n".join(report)
+        return "\n".join(report)
     finally:
         conn.close()
 
