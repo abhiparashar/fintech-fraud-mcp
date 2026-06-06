@@ -176,5 +176,63 @@ def detect_location_anomalies(threshold_minutes: int = 30) -> str:
         conn.close()
 
 
+@mcp.tool()
+def detect_late_night_large_transactions(
+    start_hour: int = 2,
+    end_hour: int = 4,
+    multiplier: float = 3.0
+) -> str:
+    """
+    Find late night transactions that are significantly larger than a user's average spend.
+    Default window is 2 AM to 4 AM with amount > 3x the user's historical average.
+    Strong indicator of account takeover or stolen card usage.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                WITH user_averages AS (
+                    SELECT
+                        user_id,
+                        ROUND(AVG(amount)::numeric, 2) AS avg_amount
+                    FROM transactions
+                    GROUP BY user_id
+                )
+                SELECT
+                    t.user_id,
+                    t.merchant,
+                    t.amount,
+                    ROUND(u.avg_amount::numeric, 2)          AS user_avg_amount,
+                    ROUND((t.amount / u.avg_amount)::numeric, 1) AS times_above_avg,
+                    t.txn_date,
+                    t.location,
+                    t.ip_address,
+                    t.category
+                FROM transactions t
+                JOIN user_averages u ON t.user_id = u.user_id
+                WHERE
+                    EXTRACT(HOUR FROM t.txn_date) >= %s
+                    AND EXTRACT(HOUR FROM t.txn_date) < %s
+                    AND t.amount > %s * u.avg_amount
+                ORDER BY t.amount DESC
+            """, (start_hour, end_hour, multiplier))
+
+            rows = cur.fetchall()
+            if not rows:
+                return "No suspicious late night transactions found."
+
+            result = []
+            for row in rows:
+                result.append(
+                    f"user {row['user_id']} | {row['merchant']} | ₹{row['amount']} | "
+                    f"{row['times_above_avg']}x their avg (₹{row['user_avg_amount']}) | "
+                    f"{row['txn_date']} | {row['location']} | IP: {row['ip_address']}"
+                )
+
+            return f"Found {len(rows)} suspicious late night transaction(s):\n\n" + "\n".join(result)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
