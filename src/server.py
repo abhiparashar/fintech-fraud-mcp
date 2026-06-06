@@ -116,5 +116,65 @@ def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
         conn.close()
 
 
+INDIAN_CITIES = (
+    'Mumbai', 'Delhi', 'Bangalore', 'Chennai',
+    'Hyderabad', 'Pune', 'Kolkata', 'Ahmedabad',
+    'Jaipur', 'Surat', 'Lucknow', 'Kanpur'
+)
+
+@mcp.tool()
+def detect_location_anomalies(threshold_minutes: int = 30) -> str:
+    """
+    Find impossible location changes — same user appearing in an Indian city
+    and a foreign location within a short time window.
+    Flags likely card cloning or stolen card details used abroad.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    a.user_id,
+                    a.location                                            AS location_first,
+                    b.location                                            AS location_second,
+                    a.txn_date                                            AS time_first,
+                    b.txn_date                                            AS time_second,
+                    EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int / 60 AS minutes_apart,
+                    a.merchant                                            AS merchant_first,
+                    b.merchant                                            AS merchant_second,
+                    a.amount                                              AS amount_first,
+                    b.amount                                              AS amount_second,
+                    a.ip_address                                          AS ip_first,
+                    b.ip_address                                          AS ip_second
+                FROM transactions a
+                JOIN transactions b
+                    ON  a.user_id  = b.user_id
+                    AND a.txn_date < b.txn_date
+                    AND a.location <> b.location
+                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) / 60 < %s
+                WHERE
+                    a.location = ANY(%s) AND b.location <> ALL(%s)
+                ORDER BY a.user_id, a.txn_date
+            """, (threshold_minutes, list(INDIAN_CITIES), list(INDIAN_CITIES)))
+
+            rows = cur.fetchall()
+            if not rows:
+                return "No impossible location changes found."
+
+            result = []
+            for row in rows:
+                result.append(
+                    f"user {row['user_id']} | "
+                    f"{row['location_first']} ({row['merchant_first']} ₹{row['amount_first']}) at {row['time_first']} → "
+                    f"{row['location_second']} ({row['merchant_second']} ₹{row['amount_second']}) at {row['time_second']} | "
+                    f"{row['minutes_apart']} min apart | "
+                    f"IPs: {row['ip_first']} → {row['ip_second']}"
+                )
+
+            return f"Found {len(rows)} impossible location change(s):\n\n" + "\n".join(result)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
