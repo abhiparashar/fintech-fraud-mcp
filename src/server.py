@@ -394,5 +394,122 @@ def get_user_profile(user_id: int) -> str:
         conn.close()
 
 
+@mcp.tool()
+def get_fraud_summary() -> str:
+    """
+    Run all fraud detectors in one shot and return a consolidated report.
+    Highlights users who appear in multiple fraud patterns — the highest risk cases.
+    Use this as the starting point for any fraud investigation.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # --- duplicate transactions ---
+            cur.execute("""
+                SELECT ARRAY_AGG(DISTINCT a.user_id) AS user_ids, COUNT(*) AS count
+                FROM transactions a
+                JOIN transactions b
+                    ON  a.user_id  = b.user_id
+                    AND a.merchant = b.merchant
+                    AND a.amount   = b.amount
+                    AND a.txn_date < b.txn_date
+                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) < 60
+            """)
+            dup = cur.fetchone()
+            dup_count = dup['count'] or 0
+            dup_users = set(dup['user_ids'] or [])
+
+            # --- location anomalies ---
+            cur.execute("""
+                SELECT ARRAY_AGG(DISTINCT a.user_id) AS user_ids, COUNT(*) AS count
+                FROM transactions a
+                JOIN transactions b
+                    ON  a.user_id  = b.user_id
+                    AND a.txn_date < b.txn_date
+                    AND a.location <> b.location
+                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) / 60 < 30
+                WHERE a.location = ANY(%s) AND b.location <> ALL(%s)
+            """, (list(INDIAN_CITIES), list(INDIAN_CITIES)))
+            loc = cur.fetchone()
+            loc_count = loc['count'] or 0
+            loc_users = set(loc['user_ids'] or [])
+
+            # --- late night large transactions ---
+            cur.execute("""
+                WITH user_averages AS (
+                    SELECT user_id, AVG(amount) AS avg_amount
+                    FROM transactions GROUP BY user_id
+                )
+                SELECT ARRAY_AGG(DISTINCT t.user_id) AS user_ids, COUNT(*) AS count
+                FROM transactions t
+                JOIN user_averages u ON t.user_id = u.user_id
+                WHERE EXTRACT(HOUR FROM t.txn_date) >= 2
+                  AND EXTRACT(HOUR FROM t.txn_date) < 4
+                  AND t.amount > 3 * u.avg_amount
+            """)
+            late = cur.fetchone()
+            late_count = late['count'] or 0
+            late_users = set(late['user_ids'] or [])
+
+            # --- rapid fire ---
+            cur.execute("""
+                WITH burst_check AS (
+                    SELECT a.user_id
+                    FROM transactions a
+                    JOIN transactions b
+                        ON  a.user_id = b.user_id
+                        AND b.txn_date BETWEEN
+                            a.txn_date - INTERVAL '90 seconds'
+                            AND a.txn_date + INTERVAL '90 seconds'
+                    GROUP BY a.user_id, a.txn_date
+                    HAVING COUNT(b.*) >= 5
+                )
+                SELECT ARRAY_AGG(DISTINCT user_id) AS user_ids, COUNT(DISTINCT user_id) AS count
+                FROM burst_check
+            """)
+            rapid = cur.fetchone()
+            rapid_count = rapid['count'] or 0
+            rapid_users = set(rapid['user_ids'] or [])
+
+            # --- find high risk users (flagged by 2+ detectors) ---
+            all_flagged: dict[int, list[str]] = {}
+            for user_id in dup_users:
+                all_flagged.setdefault(user_id, []).append("duplicate charges")
+            for user_id in loc_users:
+                all_flagged.setdefault(user_id, []).append("impossible location")
+            for user_id in late_users:
+                all_flagged.setdefault(user_id, []).append("late night large spend")
+            for user_id in rapid_users:
+                all_flagged.setdefault(user_id, []).append("rapid fire")
+
+            high_risk = {uid: flags for uid, flags in all_flagged.items() if len(flags) >= 2}
+            total_flagged_users = len(all_flagged)
+
+            # --- build report ---
+            report = [
+                "FRAUD SUMMARY REPORT",
+                "=" * 40,
+                f"Duplicate charge pairs     : {dup_count}  (users: {sorted(dup_users) or 'none'})",
+                f"Impossible location jumps  : {loc_count}  (users: {sorted(loc_users) or 'none'})",
+                f"Late night large spends    : {late_count}  (users: {sorted(late_users) or 'none'})",
+                f"Rapid fire bursts          : {rapid_count}  (users: {sorted(rapid_users) or 'none'})",
+                f"\nTotal flagged users        : {total_flagged_users}",
+                "",
+                "HIGH RISK USERS (2+ fraud patterns)",
+                "-" * 40,
+            ]
+
+            if high_risk:
+                for uid, flags in sorted(high_risk.items()):
+                    report.append(f"  user {uid} → {' + '.join(flags)}")
+            else:
+                report.append("  None found.")
+
+            return "\n".join(report)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
