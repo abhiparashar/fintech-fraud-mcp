@@ -278,54 +278,88 @@ def get_user_profile(user_id: int) -> str:
 @mcp.tool()
 def get_fraud_summary() -> str:
     """
-    Run all fraud detectors in one shot and return a consolidated report.
-    Highlights users who appear in multiple fraud patterns — the highest risk cases.
-    Use this as the starting point for any fraud investigation.
+    Return a pre-computed fraud summary from the fraud_user_flags materialized view.
+    Instant read — no heavy queries at call time.
+    Call refresh_fraud_summary first if you need up-to-the-minute results.
     """
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            dup_rows   = _fetch_duplicate_rows(cur)
-            loc_rows   = _fetch_location_anomaly_rows(cur)
-            late_rows  = _fetch_late_night_rows(cur)
-            rapid_rows = _fetch_rapid_fire_rows(cur)
+            cur.execute("""
+                SELECT
+                    pattern,
+                    COUNT(*)                              AS user_count,
+                    ARRAY_AGG(user_id ORDER BY user_id)   AS affected_users
+                FROM fraud_user_flags
+                GROUP BY pattern
+                ORDER BY pattern
+            """)
+            stats = {row['pattern']: row for row in cur.fetchall()}
 
-        dup_users   = {row['user_id'] for row in dup_rows}
-        loc_users   = {row['user_id'] for row in loc_rows}
-        late_users  = {row['user_id'] for row in late_rows}
-        rapid_users = {row['user_id'] for row in rapid_rows}
+            cur.execute("""
+                SELECT
+                    user_id,
+                    ARRAY_AGG(pattern ORDER BY pattern) AS patterns
+                FROM fraud_user_flags
+                GROUP BY user_id
+                HAVING COUNT(*) >= 2
+                ORDER BY user_id
+            """)
+            high_risk = cur.fetchall()
 
-        all_flagged: dict[int, list[str]] = {}
-        for uid in dup_users:
-            all_flagged.setdefault(uid, []).append("duplicate charges")
-        for uid in loc_users:
-            all_flagged.setdefault(uid, []).append("impossible location")
-        for uid in late_users:
-            all_flagged.setdefault(uid, []).append("late night large spend")
-        for uid in rapid_users:
-            all_flagged.setdefault(uid, []).append("rapid fire")
+        pattern_labels = {
+            'duplicate_charges':      'Duplicate charge users    ',
+            'impossible_location':    'Impossible location jumps ',
+            'late_night_large_spend': 'Late night large spends   ',
+            'rapid_fire':             'Rapid fire bursts         ',
+        }
 
-        high_risk = {uid: flags for uid, flags in all_flagged.items() if len(flags) >= 2}
+        all_flagged_users: set[int] = set()
+        report = ["FRAUD SUMMARY REPORT", "=" * 40]
 
-        report = [
-            "FRAUD SUMMARY REPORT",
-            "=" * 40,
-            f"Duplicate charge pairs     : {len(dup_rows)}   (users: {sorted(dup_users) or 'none'})",
-            f"Impossible location jumps  : {len(loc_rows)}   (users: {sorted(loc_users) or 'none'})",
-            f"Late night large spends    : {len(late_rows)}   (users: {sorted(late_users) or 'none'})",
-            f"Rapid fire bursts          : {len(rapid_rows)}   (users: {sorted(rapid_users) or 'none'})",
-            f"\nTotal flagged users        : {len(all_flagged)}",
+        for key, label in pattern_labels.items():
+            row = stats.get(key)
+            if row:
+                users = sorted(row['affected_users'])
+                all_flagged_users.update(users)
+                report.append(f"{label}: {row['user_count']}   (users: {users})")
+            else:
+                report.append(f"{label}: 0   (users: none)")
+
+        report += [
+            f"\nTotal flagged users        : {len(all_flagged_users)}",
             "",
             "HIGH RISK USERS (2+ fraud patterns)",
             "-" * 40,
         ]
 
         if high_risk:
-            for uid, flags in sorted(high_risk.items()):
-                report.append(f"  user {uid} → {' + '.join(flags)}")
+            for row in high_risk:
+                report.append(f"  user {row['user_id']} → {' + '.join(row['patterns'])}")
         else:
             report.append("  None found.")
 
         return "\n".join(report)
+    except Exception as e:
+        if 'fraud_user_flags' in str(e):
+            return "Materialized view not found. Run: psql -U postgres -d fintechdb -f migrations/001_fraud_summary_mv.sql"
+        raise
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def refresh_fraud_summary() -> str:
+    """
+    Refresh the fraud_user_flags materialized view with the latest transaction data.
+    This re-runs all 4 fraud detection queries and stores the results.
+    Call this after new transactions are added, then call get_fraud_summary to read results.
+    """
+    conn = get_connection()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fraud_user_flags")
+        return "Refreshed. Call get_fraud_summary to see updated results."
     finally:
         conn.close()
