@@ -1,4 +1,6 @@
 import psycopg2.extras
+from threading import RLock
+from cachetools import TTLCache, cached
 from app import mcp
 from db import (
     get_connection,
@@ -7,6 +9,9 @@ from db import (
     _fetch_late_night_rows,
     _fetch_rapid_fire_rows,
 )
+
+_profile_cache: TTLCache = TTLCache(maxsize=500, ttl=300)
+_profile_lock = RLock()
 
 
 @mcp.tool()
@@ -174,6 +179,7 @@ def detect_rapid_fire_transactions(
 
 
 @mcp.tool()
+@cached(cache=_profile_cache, lock=_profile_lock)
 def get_user_profile(user_id: int) -> str:
     """
     Get a full spending profile for a specific user.
