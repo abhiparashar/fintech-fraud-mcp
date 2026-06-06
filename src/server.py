@@ -64,5 +64,57 @@ def query_transactions(sql: str) -> str:
         conn.close()
 
 
+@mcp.tool()
+def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
+    """
+    Find duplicate transactions — same user, same amount, same merchant
+    within a given time window (default 60 seconds).
+    Returns each suspicious pair along with IP addresses to help
+    distinguish a double charge from a replay attack.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    a.user_id,
+                    a.merchant,
+                    a.amount,
+                    a.txn_date    AS first_txn,
+                    b.txn_date    AS second_txn,
+                    EXTRACT(EPOCH FROM (b.txn_date - a.txn_date))::int AS seconds_apart,
+                    a.ip_address  AS ip_first,
+                    b.ip_address  AS ip_second,
+                    a.location    AS location_first,
+                    b.location    AS location_second
+                FROM transactions a
+                JOIN transactions b
+                    ON  a.user_id  = b.user_id
+                    AND a.merchant = b.merchant
+                    AND a.amount   = b.amount
+                    AND a.txn_date < b.txn_date
+                    AND EXTRACT(EPOCH FROM (b.txn_date - a.txn_date)) < %s
+                ORDER BY a.user_id, a.txn_date
+            """, (threshold_seconds,))
+
+            rows = cur.fetchall()
+            if not rows:
+                return "No duplicate transactions found."
+
+            result = []
+            for row in rows:
+                same_ip = row['ip_first'] == row['ip_second']
+                hint = "likely double charge (same IP)" if same_ip else "suspicious — different IPs, possible replay attack"
+                result.append(
+                    f"user {row['user_id']} | {row['merchant']} | ₹{row['amount']} | "
+                    f"{row['first_txn']} → {row['second_txn']} | "
+                    f"{row['seconds_apart']}s apart | {hint}"
+                )
+
+            return f"Found {len(rows)} duplicate pair(s):\n\n" + "\n".join(result)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
