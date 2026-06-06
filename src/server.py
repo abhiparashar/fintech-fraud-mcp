@@ -297,5 +297,102 @@ def detect_rapid_fire_transactions(
         conn.close()
 
 
+@mcp.tool()
+def get_user_profile(user_id: int) -> str:
+    """
+    Get a full spending profile for a specific user.
+    Use this before making a fraud judgement — understand what is
+    normal for this user before flagging anything as suspicious.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                        AS total_transactions,
+                    ROUND(SUM(amount)::numeric, 2)                  AS total_spend,
+                    ROUND(AVG(amount)::numeric, 2)                  AS avg_spend,
+                    ROUND(MIN(amount)::numeric, 2)                  AS min_spend,
+                    ROUND(MAX(amount)::numeric, 2)                  AS max_spend,
+                    MIN(txn_date)                                   AS first_transaction,
+                    MAX(txn_date)                                   AS last_transaction,
+                    COUNT(DISTINCT merchant)                        AS unique_merchants,
+                    COUNT(DISTINCT location)                        AS unique_locations,
+                    MODE() WITHIN GROUP (ORDER BY location)         AS most_common_location,
+                    MODE() WITHIN GROUP (ORDER BY category)         AS most_common_category
+                FROM transactions
+                WHERE user_id = %s
+            """, (user_id,))
+            summary = cur.fetchone()
+
+            if not summary['total_transactions']:
+                return f"No transactions found for user {user_id}."
+
+            cur.execute("""
+                SELECT category, COUNT(*) AS count, ROUND(SUM(amount)::numeric, 2) AS total
+                FROM transactions
+                WHERE user_id = %s
+                GROUP BY category
+                ORDER BY count DESC
+            """, (user_id,))
+            categories = cur.fetchall()
+
+            cur.execute("""
+                SELECT merchant, COUNT(*) AS count, ROUND(SUM(amount)::numeric, 2) AS total
+                FROM transactions
+                WHERE user_id = %s
+                GROUP BY merchant
+                ORDER BY count DESC
+                LIMIT 5
+            """, (user_id,))
+            top_merchants = cur.fetchall()
+
+            cur.execute("""
+                SELECT
+                    EXTRACT(HOUR FROM txn_date)::int AS hour,
+                    COUNT(*) AS count
+                FROM transactions
+                WHERE user_id = %s
+                GROUP BY hour
+                ORDER BY count DESC
+                LIMIT 3
+            """, (user_id,))
+            active_hours = cur.fetchall()
+
+            category_breakdown = " | ".join(
+                f"{r['category']}: {r['count']} txns (₹{r['total']})"
+                for r in categories
+            )
+            merchant_breakdown = " | ".join(
+                f"{r['merchant']} x{r['count']} (₹{r['total']})"
+                for r in top_merchants
+            )
+            hours_breakdown = ", ".join(
+                f"{r['hour']}:00 ({r['count']} txns)"
+                for r in active_hours
+            )
+
+            return (
+                f"User {user_id} Profile\n"
+                f"{'─' * 40}\n"
+                f"Total transactions : {summary['total_transactions']}\n"
+                f"Total spend        : ₹{summary['total_spend']}\n"
+                f"Average spend      : ₹{summary['avg_spend']}\n"
+                f"Min / Max spend    : ₹{summary['min_spend']} / ₹{summary['max_spend']}\n"
+                f"Active since       : {summary['first_transaction']}\n"
+                f"Last transaction   : {summary['last_transaction']}\n"
+                f"Unique merchants   : {summary['unique_merchants']}\n"
+                f"Unique locations   : {summary['unique_locations']}\n"
+                f"Most common city   : {summary['most_common_location']}\n"
+                f"Most common cat    : {summary['most_common_category']}\n\n"
+                f"Category breakdown : {category_breakdown}\n"
+                f"Top merchants      : {merchant_breakdown}\n"
+                f"Most active hours  : {hours_breakdown}"
+            )
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
