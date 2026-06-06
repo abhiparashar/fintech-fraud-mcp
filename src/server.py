@@ -465,4 +465,6 @@ def get_fraud_summary() -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="sse")
+    import sys
+    transport = "sse" if "--sse" in sys.argv else "stdio"
+    mcp.run(transport=transport)
