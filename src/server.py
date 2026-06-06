@@ -234,5 +234,68 @@ def detect_late_night_large_transactions(
         conn.close()
 
 
+@mcp.tool()
+def detect_rapid_fire_transactions(
+    window_seconds: int = 90,
+    min_txn_count: int = 5
+) -> str:
+    """
+    Find users who made many transactions within a short time window.
+    Default: 5 or more transactions within 90 seconds.
+    Strong indicator of bot activity or card testing.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                WITH burst_check AS (
+                    SELECT
+                        a.user_id,
+                        a.txn_date,
+                        a.merchant,
+                        a.amount,
+                        COUNT(b.*) AS nearby_count
+                    FROM transactions a
+                    JOIN transactions b
+                        ON  a.user_id = b.user_id
+                        AND b.txn_date BETWEEN
+                            a.txn_date - INTERVAL '1 second' * %s
+                            AND
+                            a.txn_date + INTERVAL '1 second' * %s
+                    GROUP BY a.user_id, a.txn_date, a.merchant, a.amount
+                    HAVING COUNT(b.*) >= %s
+                )
+                SELECT
+                    user_id,
+                    COUNT(*)                                                      AS flagged_txn_count,
+                    MIN(txn_date)                                                 AS burst_start,
+                    MAX(txn_date)                                                 AS burst_end,
+                    EXTRACT(EPOCH FROM (MAX(txn_date) - MIN(txn_date)))::int      AS duration_seconds,
+                    SUM(amount)                                                   AS total_amount,
+                    STRING_AGG(DISTINCT merchant, ', ')                           AS merchants
+                FROM burst_check
+                GROUP BY user_id
+                ORDER BY flagged_txn_count DESC
+            """, (window_seconds, window_seconds, min_txn_count))
+
+            rows = cur.fetchall()
+            if not rows:
+                return "No rapid fire transaction bursts found."
+
+            result = []
+            for row in rows:
+                result.append(
+                    f"user {row['user_id']} | "
+                    f"{row['flagged_txn_count']} transactions in {row['duration_seconds']}s | "
+                    f"₹{row['total_amount']} total | "
+                    f"burst: {row['burst_start']} → {row['burst_end']} | "
+                    f"merchants: {row['merchants']}"
+                )
+
+            return f"Found {len(rows)} user(s) with rapid fire bursts:\n\n" + "\n".join(result)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
