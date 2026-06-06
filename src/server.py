@@ -40,5 +40,29 @@ def get_schema() -> str:
         conn.close()
 
 
+@mcp.tool()
+def query_transactions(sql: str) -> str:
+    """
+    Run a read-only SELECT query on the transactions table.
+    Use this for ad-hoc analysis that other tools don't cover.
+    """
+    if not sql.strip().lower().startswith("select"):
+        return "Error: only SELECT queries are allowed."
+
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            if not rows:
+                return "No results found."
+            result = "\n".join(str(dict(row)) for row in rows)
+            return f"Query returned {len(rows)} row(s):\n\n{result}"
+    except Exception as e:
+        return f"Query error: {str(e)}"
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run(transport="sse")
