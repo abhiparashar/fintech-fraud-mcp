@@ -7,7 +7,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import psycopg2.extensions
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, wait_random, retry_if_exception_type
 from tracing import new_trace_id, get_trace_id
 from metrics import tool_calls_total, tool_duration_seconds
 
@@ -59,7 +59,7 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
 @retry(
     retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.pool.PoolError)),
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
+    wait=wait_exponential(multiplier=1, min=1, max=5) + wait_random(0, 1),
     reraise=True,
     before_sleep=lambda rs: logger.warning(
         "DB connection attempt %d failed, retrying...", rs.attempt_number
@@ -105,7 +105,7 @@ def _get_readonly_pool() -> psycopg2.pool.ThreadedConnectionPool:
 @retry(
     retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.pool.PoolError)),
     stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=1, max=3),
+    wait=wait_exponential(multiplier=1, min=1, max=3) + wait_random(0, 1),
     reraise=True,
 )
 def get_readonly_connection() -> psycopg2.extensions.connection:

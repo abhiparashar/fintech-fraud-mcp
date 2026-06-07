@@ -6,7 +6,10 @@ services:
     environment:
       DB_HOST: db       # override whatever is in .env — always use the container
       DB_PORT: 5432
-      MCP_API_KEY: ${MCP_API_KEY:-}   # pass through from shell: export MCP_API_KEY=secret
+      MCP_API_KEY: ${MCP_API_KEY:-}                        # export MCP_API_KEY=secret
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-60}      # export RATE_LIMIT_REQUESTS=5
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      MV_REFRESH_INTERVAL_SECONDS: ${MV_REFRESH_INTERVAL_SECONDS:-300}
     env_file:
       - .env
     depends_on:

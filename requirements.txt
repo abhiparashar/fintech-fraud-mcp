@@ -4,3 +4,4 @@ uvicorn
 cachetools
 tenacity
 prometheus_client
+sqlglot

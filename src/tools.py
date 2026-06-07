@@ -1,5 +1,7 @@
 import threading
 import logging
+import sqlglot
+import sqlglot.expressions as sqlexp
 import psycopg2.extras
 import psycopg2.errors
 from threading import RLock
@@ -21,13 +23,39 @@ from metrics import profile_cache_hits_total, profile_cache_misses_total
 
 logger = logging.getLogger(__name__)
 
-# Keywords that must never appear in ad-hoc queries.
-# Even inside a SELECT, these can exfiltrate data, sleep the DB, or write files.
-_BLOCKED_KEYWORDS = frozenset({
+# Functions blocked from ad-hoc queries — checked via AST, not string matching,
+# so comment-injection tricks like pg_/**/sleep bypass the check.
+_BLOCKED_FUNCTIONS = frozenset({
     'pg_sleep', 'pg_read_file', 'pg_write_file', 'pg_ls_dir',
     'pg_stat_file', 'pg_execute_server_program', 'lo_import', 'lo_export',
-    'dblink', 'copy',
+    'dblink',
 })
+
+
+def _validate_query(sql: str) -> str | None:
+    """Parse SQL into an AST and reject anything that isn't a single safe SELECT.
+    Returns an error string if invalid, None if the query is safe to run."""
+    try:
+        statements = sqlglot.parse(sql.strip(), dialect="postgres")
+    except sqlglot.errors.ParseError as e:
+        return f"Error: could not parse SQL — {e}"
+
+    if not statements:
+        return "Error: empty query."
+    if len(statements) > 1:
+        return "Error: only a single statement is allowed."
+
+    stmt = statements[0]
+    if not isinstance(stmt, sqlexp.Select):
+        return "Error: only SELECT queries are allowed."
+
+    for node in stmt.walk():
+        if isinstance(node, (sqlexp.Anonymous, sqlexp.Func)):
+            fname = (node.name or "").lower()
+            if fname in _BLOCKED_FUNCTIONS:
+                return f"Error: function '{fname}' is not permitted in ad-hoc queries."
+
+    return None
 
 
 class _TrackedTTLCache(TTLCache):
@@ -78,11 +106,9 @@ def query_transactions(sql: str) -> str:
     Executes as fraud_reader — a restricted user with SELECT-only access.
     Use this for ad-hoc analysis that other tools don't cover.
     """
-    stripped = sql.strip().lower()
-    if not stripped.startswith("select"):
-        return "Error: only SELECT queries are allowed."
-    if any(kw in stripped for kw in _BLOCKED_KEYWORDS):
-        return "Error: query contains a blocked keyword. System functions and file operations are not permitted."
+    err = _validate_query(sql)
+    if err:
+        return err
 
     conn = get_readonly_connection()
     try:
