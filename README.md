@@ -24,12 +24,41 @@ This server exposes 9 tools to Claude over **HTTP/SSE transport**. SSE (Server-S
 
 ## Prerequisites
 
-- Python 3.11+
-- PostgreSQL 16 (`brew install postgresql@16`)
-- Docker (for containerised deployment)
+- Docker (for the self-contained dev stack — no local postgres needed)
+- Python 3.11+ and PostgreSQL 16 (only if running without Docker)
 - Claude Code CLI
 
-## Quick start
+## Quick start — Docker (recommended)
+
+Zero dependencies beyond Docker. Postgres, migrations, and seed data are all included.
+
+```bash
+# 1. Clone and enter the project
+git clone https://github.com/abhiparashar/fintech-fraud-mcp
+cd fintech-fraud-mcp
+
+# 2. Configure environment
+cp .env.example .env       # defaults work out of the box for dev
+
+# 3. Start the full stack (app + postgres, auto-migrated + seeded)
+make dev-up-d
+
+# 4. Verify it's running
+make health
+# {"status": "healthy", "db": "connected"}
+
+# 5. Register with Claude Code and connect
+make mcp-add
+claude
+```
+
+The first `make dev-up-d` builds the image and runs all migrations automatically. Subsequent starts reuse the existing data volume. To reset to a clean slate:
+
+```bash
+make dev-reset    # wipes the DB volume and re-seeds everything fresh
+```
+
+## Quick start — local (no Docker)
 
 ```bash
 # 1. Clone and enter the project
@@ -73,7 +102,14 @@ make test          # run manual test suite
 make health        # curl /health with formatted output
 make metrics       # curl /metrics (Prometheus)
 
-# Docker (local, HTTP)
+# Docker dev stack (app + bundled postgres, seed data included)
+make dev-up        # start app + postgres (foreground)
+make dev-up-d      # start app + postgres (background)
+make dev-down      # stop
+make dev-logs      # tail logs
+make dev-reset     # wipe DB volume and restart fresh
+
+# Docker app-only (external DB, HTTP)
 make build         # build Docker image
 make up            # start with Docker Compose (foreground)
 make up-d          # start with Docker Compose (background)
@@ -111,13 +147,20 @@ Copy `.env.example` to `.env` and fill in your values. Never commit `.env`.
 
 ## Running the server
 
+**Dev stack — app + postgres bundled (recommended):**
+```bash
+make dev-up-d
+# server at http://localhost:8000
+# postgres at localhost:5433
+```
+
 **Local (no Docker):**
 ```bash
 make run
 # server at http://localhost:8000
 ```
 
-**Local (Docker):**
+**App only — Docker with external DB:**
 ```bash
 make build
 make up-d
@@ -219,8 +262,9 @@ migrations/
   002_readonly_user.sql     — fraud_reader user with SELECT-only access
 
 Dockerfile              — Production image (non-root user, healthcheck)
-docker-compose.yml      — Local Docker deployment (HTTP)
-docker-compose.prod.yml — Production Docker deployment (app + Caddy HTTPS)
+docker-compose.dev.yml  — Dev stack: app + postgres with seed data (self-contained)
+docker-compose.yml      — App only (external DB, HTTP)
+docker-compose.prod.yml — Production: app + Caddy HTTPS
 Caddyfile               — Caddy reverse proxy config (auto TLS via Let's Encrypt)
 Makefile                — All commands in one place
 .env.example            — Environment variable template
