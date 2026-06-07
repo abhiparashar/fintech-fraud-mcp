@@ -19,21 +19,40 @@ Think of it as four acts. Each one answers a question the CTO is silently asking
 
 ---
 
-## Before you start — prerequisites
+## Night before — setup (do this at home)
 
 ```bash
-# PostgreSQL running
-brew services list | grep postgresql
-# postgresql@16  started
-
-# Dependencies installed
-ls .venv/bin/python3
-# .venv/bin/python3
+cp .env.example .env
+make dev-up-d          # builds image, starts app + postgres, runs migrations, seeds DB
+make health            # confirm: {"status": "healthy", "db": "connected"}
+make mcp-add           # register server with Claude Code (one-time)
+make dev-down          # stop — you'll restart fresh on the day
 ```
 
-Open two terminal windows and keep them side by side throughout the demo.
-- **Terminal A** — server (logs visible here)
-- **Terminal B** — commands you run
+That's all the setup. On demo day just run `make dev-up-d` and everything is ready.
+
+---
+
+## Demo day — exact commands in order
+
+Open **two terminal windows** side by side before the CTO walks in.
+
+```
+Terminal A  →  server logs (keep visible throughout)
+Terminal B  →  commands you run live
+```
+
+**Terminal A — start everything:**
+```bash
+make dev-up-d          # starts app + postgres in background
+make dev-logs          # stream logs so CTO can see them live
+```
+
+**Terminal B — confirm it's up:**
+```bash
+make health
+# {"status": "healthy", "db": "connected"}
+```
 
 ---
 
@@ -41,11 +60,13 @@ Open two terminal windows and keep them side by side throughout the demo.
 
 > "We have thousands of transactions. Finding fraud manually is impossible."
 
-Show the raw data — no code, just the DB:
-
+**Terminal B:**
 ```bash
-psql -U postgres -d fintechdb -c "SELECT COUNT(*) FROM transactions;"
-psql -U postgres -d fintechdb -c "SELECT * FROM transactions LIMIT 5;"
+psql -h localhost -p 5433 -U postgres -d fintechdb \
+  -c "SELECT COUNT(*) FROM transactions;"
+
+psql -h localhost -p 5433 -U postgres -d fintechdb \
+  -c "SELECT * FROM transactions LIMIT 5;"
 ```
 
 Say: *"A human analyst would need hours to run the right queries across all these records. I've built an AI-powered fraud detection system where Claude does this analysis in seconds — connected to the live database."*
@@ -54,20 +75,14 @@ Say: *"A human analyst would need hours to run the right queries across all thes
 
 ## Act 2 — It Works (3 min)
 
-**Terminal A — start the server:**
+**Terminal B — open Claude Code:**
 ```bash
-make run
+claude
 ```
 
 Expected — JSON logs, server ready:
 ```
 {"time": "...", "level": "INFO", "message": "Uvicorn running on http://0.0.0.0:8000"}
-```
-
-**Terminal B — register with Claude Code (one-time):**
-```bash
-make mcp-add
-claude
 ```
 
 Verify connection inside Claude:
@@ -134,10 +149,11 @@ Point at Terminal A. Show a log line:
 *"Every log line is JSON with a trace ID. All lines for one Claude call share the same ID — filter by it in any log aggregator to see exactly what happened."*
 
 ### API key auth
-Restart server with auth enabled — Ctrl+C in Terminal A, then:
+Restart stack with auth enabled — Ctrl+C in Terminal A, then:
 ```bash
 export MCP_API_KEY=demosecret
-make run
+make dev-up-d
+make dev-logs
 ```
 
 ```bash
@@ -168,14 +184,16 @@ data: /messages/?session_id=...
 
 Restore for remaining steps:
 ```bash
-# Ctrl+C, then:
+make dev-down
 unset MCP_API_KEY
-make run
+make dev-up-d
+make dev-logs
 ```
 
 ### Error handling — DB down
+Stop just the DB container, leave the app running:
 ```bash
-brew services stop postgresql@16
+docker stop fintech-fraud-mcp-db-1
 make health
 ```
 ```json
@@ -198,7 +216,9 @@ Get the profile for user 10
 
 Restore:
 ```bash
-brew services start postgresql@16
+docker start fintech-fraud-mcp-db-1
+make health
+# {"status": "healthy", "db": "connected"}
 ```
 
 ### Query safety
@@ -238,24 +258,30 @@ Call 3 (warm) — duration=0.000s   misses: 1   hits: 2
 ```bash
 make help
 ```
-*"One command for everything."*
+*"One command for everything — no need to remember docker compose flags or curl options."*
 
-### Docker — local
+### What they just saw running
 ```bash
-make build
-make up-d
-make health
-make logs
-make down
+make dev-up-d      # started everything — app + postgres + migrations + seed data
+make dev-logs      # live JSON logs with trace IDs
+make health        # health check
+make metrics       # Prometheus metrics
+make test          # automated test suite
+make dev-down      # tear it all down
 ```
 
 ### Production with HTTPS — two steps
 ```bash
-# 1. Edit Caddyfile — put your domain name
+# 1. Edit Caddyfile — replace fraud.yourdomain.com with your domain
 # 2. Run:
 make prod-up
 ```
 *"Caddy automatically fetches a TLS certificate from Let's Encrypt. HTTPS in one command — no manual cert management."*
+
+### Connect Claude to production
+```bash
+make mcp-add-prod DOMAIN=fraud.yourdomain.com
+```
 
 ### Connect Claude to production
 ```bash
@@ -279,10 +305,12 @@ make health
 
 Simulate DB failure:
 ```bash
-brew services stop postgresql@16
+docker stop fintech-fraud-mcp-db-1
 make health
 # {"status": "unhealthy", "db": "..."}  — 503
-brew services start postgresql@16
+docker start fintech-fraud-mcp-db-1
+make health
+# {"status": "healthy", "db": "connected"}
 ```
 
 ### 2. Prometheus metrics
@@ -302,14 +330,15 @@ mcp_tool_calls_total                  ← empty until tools are called
 
 ```bash
 export MCP_API_KEY=testsecret
-make run                              # restart with auth
+make dev-down && make dev-up-d        # restart with auth
 
-curl -s http://localhost:8000/sse                         # → 401
-curl -s http://localhost:8000/health                      # → 200 (exempt)
+curl -s http://localhost:8000/sse                              # → 401
+curl -s http://localhost:8000/health                           # → 200 (exempt)
 curl -s -H "X-API-Key: testsecret" http://localhost:8000/sse  # → SSE stream
 
+make dev-down
 unset MCP_API_KEY
-make run                              # restore
+make dev-up-d                         # restore
 ```
 
 ### 4. Query safety
@@ -356,6 +385,7 @@ mcp_profile_cache_misses_total 1.0
 ### 7. Claude live tool calls
 
 ```bash
+make dev-up-d   # if not already running
 make mcp-add    # register (one-time)
 claude
 ```
