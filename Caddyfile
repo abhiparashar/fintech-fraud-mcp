@@ -1,0 +1,7 @@
+# Replace fraud.yourdomain.com with your actual domain.
+# Caddy fetches a Let's Encrypt TLS cert automatically on first start.
+# Your DNS A record must already point to this server's IP.
+
+fraud.yourdomain.com {
+    reverse_proxy app:8000
+}

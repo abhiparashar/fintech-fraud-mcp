@@ -14,10 +14,10 @@ from metrics import tool_calls_total, tool_duration_seconds
 logger = logging.getLogger(__name__)
 
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "fintechdb",
-    "user": "postgres",
+    "host":     os.environ.get("DB_HOST",     "localhost"),
+    "port":     int(os.environ.get("DB_PORT", "5432")),
+    "database": os.environ.get("DB_NAME",     "fintechdb"),
+    "user":     os.environ.get("DB_USER",     "postgres"),
     "password": os.environ.get("DB_PASSWORD", "password"),
     "connect_timeout": 5,
     "options": "-c statement_timeout=10000",
