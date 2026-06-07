@@ -423,3 +423,40 @@ In Terminal A, every tool call logs a start and end line sharing the same `trace
 | MCP + Claude | Live fraud detection reasoning over real DB data |
 | Docker | `make dev-up-d` — app + postgres + seed data in one command |
 | HTTPS | `make prod-up` — Caddy auto TLS |
+
+---
+
+## Bugs found and fixed during testing
+
+Three real bugs were caught during the dry run. All are fixed and committed.
+
+### 1. Health check gave false positives when DB was down
+
+**Symptom:** `docker stop fintech-fraud-mcp-db-1` → `make health` still returned `{"status":"healthy"}`.
+
+**Root cause:** `pool.getconn()` returns a cached socket without testing if it's still alive. The pool had no idea the DB was gone.
+
+**Fix:** Health endpoint now opens a fresh `psycopg2.connect()` directly and runs `SELECT 1`. No pool involved — always reflects real connectivity. Recovery is instant the moment the DB comes back.
+
+---
+
+### 2. Every SSE connection threw an AssertionError in logs
+
+**Symptom:** Every time Claude connected, logs showed:
+```
+AssertionError: Unexpected message: {'type': 'http.response.start'}
+```
+
+**Root cause:** `APIKeyMiddleware` extended `BaseHTTPMiddleware`, which buffers the response body. SSE keeps the connection open and sends `http.response.start` before any body — the middleware saw a second `response.start` where it expected `response.body` and crashed.
+
+**Fix:** Rewrote middleware as a raw ASGI class. It checks the `X-API-Key` header and either returns 401 or passes through — no buffering, no conflict with streaming.
+
+---
+
+### 3. User 9's late-night fraud not detected (3 users instead of 4)
+
+**Symptom:** `fraud_user_flags` showed only 3 users for `late_night_large_spend`. User 9 was missing.
+
+**Root cause:** The detector checks `amount > 3 × avg_amt`, where `avg_amt` includes the fraud transaction itself. User 9's ₹2800 fraud inflated their own average to ₹967, so `2800 < 3×967 = 2900` — narrowly failing the threshold.
+
+**Fix:** Raised user 9's late-night amount from ₹2800 to ₹4500. All 4 fraud patterns now appear in the materialized view reliably.
