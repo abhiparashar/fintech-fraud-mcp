@@ -1,97 +1,143 @@
 # CTO Demo Runbook — fintech-fraud-mcp
 
-Walk through each section in order. Expected output is shown under every command.
+---
+
+## Presentation order
+
+Think of it as four acts. Each one answers a question the CTO is silently asking.
+
+| Act | Duration | What you show | What they hear |
+|-----|----------|---------------|----------------|
+| 1 — The Problem | 2 min | Raw transactions table | "This is a real problem" |
+| 2 — It Works | 3 min | Claude detecting fraud live | "This actually works" |
+| 3 — Production Grade | 4 min | Health, metrics, logs, auth, errors | "This is production ready" |
+| 4 — Easy to Ship | 2 min | Makefile + Docker + HTTPS | "We can deploy this" |
+
+**Total: ~11 minutes. Leave 5 minutes for questions.**
+
+> Golden rule: show the value before showing the code. Acts 1 and 2 happen before any file is opened.
 
 ---
 
-## 0. Prerequisites
+## Before you start — prerequisites
 
 ```bash
 # PostgreSQL running
 brew services list | grep postgresql
 # postgresql@16  started
 
-# Virtual environment exists
+# Dependencies installed
 ls .venv/bin/python3
 # .venv/bin/python3
 ```
 
+Open two terminal windows and keep them side by side throughout the demo.
+- **Terminal A** — server (logs visible here)
+- **Terminal B** — commands you run
+
 ---
 
-## 1. Start the server
+## Act 1 — The Problem (2 min)
 
-**Terminal A — keep this open throughout the demo:**
+> "We have thousands of transactions. Finding fraud manually is impossible."
+
+Show the raw data — no code, just the DB:
+
 ```bash
-cd ~/Desktop/fintech-fraud-mcp
-.venv/bin/python3 src/server.py --sse
+psql -U postgres -d fintechdb -c "SELECT COUNT(*) FROM transactions;"
+psql -U postgres -d fintechdb -c "SELECT * FROM transactions LIMIT 5;"
 ```
 
-Expected — structured JSON logs, server ready:
+Say: *"A human analyst would need hours to run the right queries across all these records. I've built an AI-powered fraud detection system where Claude does this analysis in seconds — connected to the live database."*
+
+---
+
+## Act 2 — It Works (3 min)
+
+**Terminal A — start the server:**
+```bash
+make run
+```
+
+Expected — JSON logs, server ready:
 ```
 {"time": "...", "level": "INFO", "message": "Uvicorn running on http://0.0.0.0:8000"}
 ```
 
-**Open Terminal B for all curl and Python commands below.**
+**Terminal B — register with Claude Code (one-time):**
+```bash
+make mcp-add
+claude
+```
+
+Verify connection inside Claude:
+```
+/mcp
+```
+Expected: `fintech-fraud` listed as connected.
+
+**Now run these in Claude, in this order:**
+
+```
+Run get_fraud_summary
+```
+→ Instant fraud report. Say: *"This reads a pre-computed view — always instant, no heavy queries at call time."*
+
+```
+Get the profile for user 10
+```
+→ Full spending profile. Say: *"Claude now understands what's normal for this user before making any fraud judgment."*
+
+```
+Get the profile for user 10 again
+```
+→ Point at Terminal A: `duration=0.000s`. Say: *"Second call is instant — served from in-memory cache. No DB hit."*
+
+```
+Which users appear in more than one fraud pattern?
+```
+→ Say: *"This is the power — Claude doesn't just query, it reasons over the results."*
 
 ---
 
-## 2. Health check
+## Act 3 — Production Grade (4 min)
 
+Switch to Terminal B for each of these.
+
+### Health check
 ```bash
-curl http://localhost:8000/health
+make health
 ```
 ```json
 {"status": "healthy", "db": "connected"}
 ```
+*"One endpoint any monitoring system can ping. Returns 503 if the DB is down."*
 
-**Simulate DB failure** — shows 503 + retry behaviour:
+### Prometheus metrics
 ```bash
-brew services stop postgresql@16
-curl http://localhost:8000/health
+make metrics
 ```
+Point at these lines:
+```
+db_pool_connections_available 2.0     ← pool live, 2 idle connections ready
+mcp_tool_calls_total{...}             ← per-tool call counter
+mcp_tool_duration_seconds_sum{...}    ← latency histogram
+mcp_profile_cache_hits_total 2.0      ← cache working
+```
+*"Plug in Grafana and you have dashboards and alerts in 10 minutes."*
+
+### Structured logs with trace IDs
+Point at Terminal A. Show a log line:
 ```json
-{"status": "unhealthy", "db": "..."}
+{"trace_id": "a3f9c1b2d4e8", "message": "tool=get_user_profile finished duration=0.048s status=success"}
 ```
+*"Every log line is JSON with a trace ID. All lines for one Claude call share the same ID — filter by it in any log aggregator to see exactly what happened."*
 
-Watch Terminal A — tenacity retries fire automatically:
-```
-DB connection attempt 1 failed, retrying...
-DB connection attempt 2 failed, retrying...
-```
-
-Restore:
+### API key auth
+Restart server with auth enabled — Ctrl+C in Terminal A, then:
 ```bash
-brew services start postgresql@16
-curl http://localhost:8000/health
-```
-```json
-{"status": "healthy", "db": "connected"}
-```
-
----
-
-## 3. Prometheus metrics
-
-```bash
-curl http://localhost:8000/metrics
-```
-
-Key lines to point out:
-```
-db_pool_connections_available 2.0     ← pool live, 2 idle connections (minconn=2)
-mcp_profile_cache_hits_total 0.0      ← no tool calls yet
-mcp_tool_calls_total                  ← empty until tools are called
-```
-
----
-
-## 4. Auth middleware (API key enforcement)
-
-Restart server with auth enabled:
-```bash
-# Ctrl+C in Terminal A, then:
 export MCP_API_KEY=demosecret
-.venv/bin/python3 src/server.py --sse
+make run
 ```
 
 ```bash
@@ -118,66 +164,186 @@ curl -s -H "X-API-Key: demosecret" http://localhost:8000/sse
 event: endpoint
 data: /messages/?session_id=...
 ```
+*"API key enforcement on the SSE endpoint. Health and metrics are exempt so monitoring always works."*
 
-Disable auth for remaining steps:
+Restore for remaining steps:
 ```bash
 # Ctrl+C, then:
 unset MCP_API_KEY
-.venv/bin/python3 src/server.py --sse
+make run
 ```
 
----
-
-## 5. Query safety — blocked keywords & SELECT-only guard
-
+### Error handling — DB down
 ```bash
-.venv/bin/python3 test_manual.py
+brew services stop postgresql@16
+make health
+```
+```json
+{"status": "unhealthy", "db": "..."}
 ```
 
-Expected (Test 4 section):
+Watch Terminal A — tenacity retries fire:
+```
+DB connection attempt 1 failed, retrying...
+DB connection attempt 2 failed, retrying...
+```
+
+Call a tool from Claude — show the clean message, not a stack trace:
+```
+Get the profile for user 10
+```
+→ *"Database temporarily unavailable. Please try again in a moment."*
+
+*"Users see a clean message. The real error with the trace ID is in the logs."*
+
+Restore:
+```bash
+brew services start postgresql@16
+```
+
+### Query safety
+```bash
+make test
+```
 ```
 ✓  'SELECT pg_sleep(100)'
-   → Error: query contains a blocked keyword. System functions and file operations are not permitted.
+   → Error: query contains a blocked keyword...
 ✓  'SELECT pg_read_file("/etc")'
-   → Error: query contains a blocked keyword. System functions and file operations are not permitted.
+   → Error: query contains a blocked keyword...
 ✓  'INSERT INTO transactions'
    → Error: only SELECT queries are allowed.
 ✓  'DROP TABLE transactions'
    → Error: only SELECT queries are allowed.
 ```
+Point at Terminal A: `duration=0.000s`. *"Checks fire before any DB call — zero DB load, instant rejection."*
 
-Point out: `duration=0.000s` in Terminal A — checks fire before any DB call.
-
----
-
-## 6. TTLCache — profile caching
-
+### TTL cache proof
 ```bash
-.venv/bin/python3 test_manual.py
+make test
 ```
-
-Expected (Test 5 section):
 ```
-Call 1 (cold) — expect DB query + cache miss
-  duration=0.048s   misses: 1.0  hits: 0.0
-
-Call 2 (warm) — expect cache hit, no DB query
-  duration=0.000s   misses: 1.0  hits: 1.0
-
-Call 3 (warm) — expect cache hit again
-  duration=0.000s   misses: 1.0  hits: 2.0
+Call 1 (cold) — duration=0.048s   misses: 1   hits: 0
+Call 2 (warm) — duration=0.000s   misses: 1   hits: 1
+Call 3 (warm) — duration=0.000s   misses: 1   hits: 2
 
 ✓  1 miss + 2 hits recorded correctly
 ```
-
-First call hits DB (48ms). Next two served from in-memory cache (0ms).
+*"48ms on the first call, 0ms on every call after — in-memory cache, no DB."*
 
 ---
 
-## 7. Metrics after tool calls
+## Act 4 — Easy to Ship (2 min)
+
+### All commands in one place
+```bash
+make help
+```
+*"One command for everything."*
+
+### Docker — local
+```bash
+make build
+make up-d
+make health
+make logs
+make down
+```
+
+### Production with HTTPS — two steps
+```bash
+# 1. Edit Caddyfile — put your domain name
+# 2. Run:
+make prod-up
+```
+*"Caddy automatically fetches a TLS certificate from Let's Encrypt. HTTPS in one command — no manual cert management."*
+
+### Connect Claude to production
+```bash
+make mcp-add-prod DOMAIN=fraud.yourdomain.com
+```
+
+---
+
+## Full technical test suite (reference)
+
+These are the detailed step-by-step tests with exact expected outputs.
+
+### 1. Health check
 
 ```bash
-curl http://localhost:8000/metrics | grep mcp_tool
+make health
+```
+```json
+{"status": "healthy", "db": "connected"}
+```
+
+Simulate DB failure:
+```bash
+brew services stop postgresql@16
+make health
+# {"status": "unhealthy", "db": "..."}  — 503
+brew services start postgresql@16
+```
+
+### 2. Prometheus metrics
+
+```bash
+make metrics
+```
+
+Key metrics to check:
+```
+db_pool_connections_available 2.0     ← pool live (minconn=2)
+mcp_profile_cache_hits_total 0.0      ← no tool calls yet
+mcp_tool_calls_total                  ← empty until tools are called
+```
+
+### 3. Auth middleware
+
+```bash
+export MCP_API_KEY=testsecret
+make run                              # restart with auth
+
+curl -s http://localhost:8000/sse                         # → 401
+curl -s http://localhost:8000/health                      # → 200 (exempt)
+curl -s -H "X-API-Key: testsecret" http://localhost:8000/sse  # → SSE stream
+
+unset MCP_API_KEY
+make run                              # restore
+```
+
+### 4. Query safety
+
+```bash
+make test
+```
+
+Expected:
+```
+✓  'SELECT pg_sleep(100)'      → blocked keyword
+✓  'SELECT pg_read_file("/etc")' → blocked keyword
+✓  'INSERT INTO transactions'  → only SELECT allowed
+✓  'DROP TABLE transactions'   → only SELECT allowed
+```
+
+### 5. TTLCache
+
+```bash
+make test
+```
+
+Expected:
+```
+Call 1 (cold) — duration=0.048s   misses: 1   hits: 0
+Call 2 (warm) — duration=0.000s   misses: 1   hits: 1
+Call 3 (warm) — duration=0.000s   misses: 1   hits: 2
+✓  1 miss + 2 hits recorded correctly
+```
+
+### 6. Metrics after tool calls
+
+```bash
+make metrics | grep mcp_tool
 ```
 
 ```
@@ -187,90 +353,52 @@ mcp_profile_cache_hits_total 2.0
 mcp_profile_cache_misses_total 1.0
 ```
 
----
+### 7. Claude live tool calls
 
-## 8. Claude Code — live tool calls
-
-Connect the MCP server (one-time):
 ```bash
-claude mcp add --transport sse fintech-fraud http://localhost:8000/sse
-```
-
-Open Claude Code:
-```bash
+make mcp-add    # register (one-time)
 claude
 ```
 
-Verify connection:
-```
-/mcp
-```
-Expected: `fintech-fraud` listed as connected.
-
-**Demo sequence in Claude:**
-
+In Claude:
 ```
 Run get_fraud_summary
-```
-Returns instantly from the materialized view — no heavy queries at call time.
-
-```
 Get the profile for user 10
-```
-Watch Terminal A — first call logs `duration=~50ms`. Ask again:
-```
-Get the profile for user 10 again
-```
-Second call logs `duration=0.000s` — served from cache.
-
-```
+Get the profile for user 10 again      ← watch Terminal A: duration=0.000s
 Detect location anomalies with a 20-minute window
+Call refresh_fraud_summary             ← returns immediately
+Which users appear in more than one fraud pattern?
 ```
-Runs the impossible-travel detector live against the transactions table.
 
-```
-Call refresh_fraud_summary
-```
-Returns immediately. Watch Terminal A for the background completion:
+Watch Terminal A after `refresh_fraud_summary`:
 ```json
 {"message": "fraud_user_flags refresh completed"}
 ```
 
-```
-Which users appear in more than one fraud pattern?
-```
-Claude reads `get_fraud_summary` and reasons over the high-risk section.
+### 8. Trace ID correlation
 
----
-
-## 9. Structured logs — trace ID correlation
-
-In Terminal A, find any tool call in the logs. All lines for one invocation share the same `trace_id`:
+In Terminal A, every tool call logs a start and end line sharing the same `trace_id`:
 
 ```json
-{"trace_id": "a3f9c1b2d4e8", "message": "tool=get_fraud_summary trace=a3f9c1b2d4e8 started"}
-{"trace_id": "a3f9c1b2d4e8", "message": "tool=get_fraud_summary trace=a3f9c1b2d4e8 finished duration=0.043s status=success"}
-```
-
-Filter a single request end-to-end:
-```bash
-# In a third terminal, filter by trace ID (replace with one from your logs)
-grep "a3f9c1b2d4e8" <(journalctl) 2>/dev/null || echo "grep Terminal A output for the trace_id"
+{"trace_id": "a3f9c1b2d4e8", "message": "tool=get_fraud_summary started"}
+{"trace_id": "a3f9c1b2d4e8", "message": "tool=get_fraud_summary finished duration=0.043s status=success"}
 ```
 
 ---
 
-## Summary — what this demo covers
+## What this demo covers
 
 | Capability | How shown |
 |------------|-----------|
 | Connection pooling | `db_pool_connections_available` gauge in `/metrics` |
-| Retry on DB failure | `brew services stop` → retry log lines → clean error |
+| Retry on DB failure | `brew services stop` → retry logs → clean error message |
 | Structured logging | JSON lines with `trace_id` in Terminal A |
 | Prometheus metrics | `/metrics` before and after tool calls |
 | API key auth | 401 without key, 200 with key, health always exempt |
 | Query safety | Blocked keywords + SELECT-only guard, `duration=0.000s` |
 | In-memory cache | 48ms cold → 0ms warm, counters in `/metrics` |
-| Materialized view | `get_fraud_summary` instant read, `refresh_fraud_summary` background |
+| Materialized view | `get_fraud_summary` instant, `refresh_fraud_summary` background |
 | Background threads | Refresh returns immediately, completion logged seconds later |
 | MCP + Claude | Live fraud detection reasoning over real DB data |
+| Docker | `make build && make up-d` |
+| HTTPS | `make prod-up` — Caddy auto TLS |
