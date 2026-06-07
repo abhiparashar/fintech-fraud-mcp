@@ -6,6 +6,7 @@ services:
     environment:
       DB_HOST: db       # override whatever is in .env — always use the container
       DB_PORT: 5432
+      MCP_API_KEY: ${MCP_API_KEY:-}   # pass through from shell: export MCP_API_KEY=secret
     env_file:
       - .env
     depends_on:

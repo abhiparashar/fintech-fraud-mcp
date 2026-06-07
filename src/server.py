@@ -55,14 +55,18 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 
 async def health(request: Request) -> JSONResponse:
-    from db import _get_pool
+    import psycopg2
+    from db import DB_CONFIG
+    conn = None
     try:
-        pool = _get_pool()
-        conn = pool.getconn()
-        pool.putconn(conn)
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.cursor().execute("SELECT 1")
         return JSONResponse({"status": "healthy", "db": "connected"})
     except Exception as e:
         return JSONResponse({"status": "unhealthy", "db": str(e)}, status_code=503)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 async def metrics_endpoint(request: Request) -> Response:
