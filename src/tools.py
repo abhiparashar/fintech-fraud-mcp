@@ -3,30 +3,48 @@ import logging
 import psycopg2.extras
 import psycopg2.errors
 from threading import RLock
-from cachetools import TTLCache, cached
+from cachetools import TTLCache
+from cachetools import cached
 from app import mcp
 from db import (
     get_connection,
     release_connection,
+    get_readonly_connection,
+    release_readonly_connection,
     handle_db_errors,
     _fetch_duplicate_rows,
     _fetch_location_anomaly_rows,
     _fetch_late_night_rows,
     _fetch_rapid_fire_rows,
 )
+from metrics import profile_cache_hits_total, profile_cache_misses_total
 
 logger = logging.getLogger(__name__)
 
-_profile_cache: TTLCache = TTLCache(maxsize=500, ttl=300)
-_profile_lock = RLock()
-
 # Keywords that must never appear in ad-hoc queries.
-# Even with a SELECT, these can exfiltrate data, sleep the DB, or write files.
+# Even inside a SELECT, these can exfiltrate data, sleep the DB, or write files.
 _BLOCKED_KEYWORDS = frozenset({
     'pg_sleep', 'pg_read_file', 'pg_write_file', 'pg_ls_dir',
     'pg_stat_file', 'pg_execute_server_program', 'lo_import', 'lo_export',
     'dblink', 'copy',
 })
+
+
+class _TrackedTTLCache(TTLCache):
+    """TTLCache that increments Prometheus counters on every hit and miss."""
+
+    def __getitem__(self, key):
+        try:
+            value = super().__getitem__(key)
+            profile_cache_hits_total.inc()
+            return value
+        except KeyError:
+            profile_cache_misses_total.inc()
+            raise
+
+
+_profile_cache = _TrackedTTLCache(maxsize=500, ttl=300)
+_profile_lock = RLock()
 
 
 @mcp.tool()
@@ -57,6 +75,7 @@ def get_schema() -> str:
 def query_transactions(sql: str) -> str:
     """
     Run a read-only SELECT query on the transactions table.
+    Executes as fraud_reader — a restricted user with SELECT-only access.
     Use this for ad-hoc analysis that other tools don't cover.
     """
     stripped = sql.strip().lower()
@@ -65,7 +84,7 @@ def query_transactions(sql: str) -> str:
     if any(kw in stripped for kw in _BLOCKED_KEYWORDS):
         return "Error: query contains a blocked keyword. System functions and file operations are not permitted."
 
-    conn = get_connection()
+    conn = get_readonly_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql)
@@ -81,7 +100,7 @@ def query_transactions(sql: str) -> str:
         logger.warning("query_transactions user error [%s]: %s", type(e).__name__, e)
         return "Query error: invalid SQL or permission denied."
     finally:
-        release_connection(conn)
+        release_readonly_connection(conn)
 
 
 @mcp.tool()

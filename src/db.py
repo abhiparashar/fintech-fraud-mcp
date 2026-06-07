@@ -1,4 +1,5 @@
 import os
+import time
 import functools
 import logging
 import threading
@@ -7,6 +8,8 @@ import psycopg2.extras
 import psycopg2.pool
 import psycopg2.extensions
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tracing import new_trace_id, get_trace_id
+from metrics import tool_calls_total, tool_duration_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +19,17 @@ DB_CONFIG = {
     "database": "fintechdb",
     "user": "postgres",
     "password": os.environ.get("DB_PASSWORD", "password"),
-    "connect_timeout": 5,                       # fail fast if DB is unreachable
-    "options": "-c statement_timeout=10000",    # kill any query that runs over 10s
+    "connect_timeout": 5,
+    "options": "-c statement_timeout=10000",
+}
+
+# Separate config for the read-only pool used by query_transactions.
+# Uses fraud_reader user which has SELECT-only access — limits blast radius
+# if arbitrary SQL is passed. Run migrations/002_readonly_user.sql first.
+READONLY_DB_CONFIG = {
+    **DB_CONFIG,
+    "user":     os.environ.get("DB_READONLY_USER",     "fraud_reader"),
+    "password": os.environ.get("DB_READONLY_PASSWORD", "readonly_password"),
 }
 
 INDIAN_CITIES = (
@@ -26,9 +38,7 @@ INDIAN_CITIES = (
     'Jaipur', 'Surat', 'Lucknow', 'Kanpur'
 )
 
-# ── connection pool ───────────────────────────────────────────────────────────
-# One pool shared across all threads. Lazy-init with double-checked locking
-# so the server starts even if Postgres is temporarily unavailable.
+# ── main connection pool ──────────────────────────────────────────────────────
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 _pool_lock = threading.Lock()
@@ -42,7 +52,7 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 _pool = psycopg2.pool.ThreadedConnectionPool(
                     minconn=2, maxconn=20, **DB_CONFIG
                 )
-                logger.info("DB connection pool initialized (min=2, max=20)")
+                logger.info("main DB pool initialised (min=2, max=20)")
     return _pool
 
 
@@ -60,36 +70,96 @@ def get_connection() -> psycopg2.extensions.connection:
 
 
 def release_connection(conn: psycopg2.extensions.connection) -> None:
-    """Return a connection to the pool. Rolls back dirty state and resets autocommit."""
     if not (_pool and conn):
         return
     try:
         if conn.status != psycopg2.extensions.STATUS_READY:
             conn.rollback()
-        conn.autocommit = False  # reset in case caller set it (e.g. refresh_fraud_summary)
+        conn.autocommit = False
     except Exception:
         pass
     _pool.putconn(conn)
 
 
-# ── error handler decorator ───────────────────────────────────────────────────
-# Applied to every MCP tool. Catches psycopg2 errors, logs the real cause
-# internally, and returns a clean message to Claude with no internal details.
+# ── read-only pool (query_transactions only) ──────────────────────────────────
+
+_readonly_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_readonly_pool_lock = threading.Lock()
+
+
+def _get_readonly_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _readonly_pool
+    if _readonly_pool is None:
+        with _readonly_pool_lock:
+            if _readonly_pool is None:
+                _readonly_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1, maxconn=5, **READONLY_DB_CONFIG
+                )
+                logger.info(
+                    "readonly DB pool initialised user=%s (min=1, max=5)",
+                    READONLY_DB_CONFIG["user"],
+                )
+    return _readonly_pool
+
+
+@retry(
+    retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.pool.PoolError)),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=3),
+    reraise=True,
+)
+def get_readonly_connection() -> psycopg2.extensions.connection:
+    return _get_readonly_pool().getconn()
+
+
+def release_readonly_connection(conn: psycopg2.extensions.connection) -> None:
+    if not (_readonly_pool and conn):
+        return
+    try:
+        if conn.status != psycopg2.extensions.STATUS_READY:
+            conn.rollback()
+        conn.autocommit = False
+    except Exception:
+        pass
+    _readonly_pool.putconn(conn)
+
+
+# ── error handler + observability decorator ───────────────────────────────────
+# Applied to every MCP tool. Sets a trace ID, records Prometheus metrics,
+# logs start/end with duration, and converts raw psycopg2 exceptions into
+# clean messages so internal details never reach Claude.
 
 def handle_db_errors(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        tid = new_trace_id()
+        start = time.perf_counter()
+        status = 'success'
+        logger.info("tool=%s trace=%s started", fn.__name__, tid)
         try:
             return fn(*args, **kwargs)
         except psycopg2.OperationalError as e:
-            logger.error("DB unavailable in %s: %s", fn.__name__, e)
+            status = 'error'
+            logger.error("tool=%s trace=%s DB unavailable: %s", fn.__name__, tid, e)
             return "Database temporarily unavailable. Please try again in a moment."
         except psycopg2.Error as e:
-            logger.error("DB error in %s [%s]: %s", fn.__name__, type(e).__name__, e)
+            status = 'error'
+            logger.error(
+                "tool=%s trace=%s DB error [%s]: %s", fn.__name__, tid, type(e).__name__, e
+            )
             return "A database error occurred. Check server logs for details."
         except Exception:
-            logger.exception("Unexpected error in %s", fn.__name__)
+            status = 'error'
+            logger.exception("tool=%s trace=%s unexpected error", fn.__name__, tid)
             return "An unexpected error occurred. Check server logs."
+        finally:
+            duration = time.perf_counter() - start
+            tool_calls_total.labels(tool=fn.__name__, status=status).inc()
+            tool_duration_seconds.labels(tool=fn.__name__).observe(duration)
+            logger.info(
+                "tool=%s trace=%s finished duration=%.3fs status=%s",
+                fn.__name__, tid, duration, status,
+            )
     return wrapper
 
 
