@@ -80,11 +80,6 @@ Say: *"A human analyst would need hours to run the right queries across all thes
 claude
 ```
 
-Expected — JSON logs, server ready:
-```
-{"time": "...", "level": "INFO", "message": "Uvicorn running on http://0.0.0.0:8000"}
-```
-
 Verify connection inside Claude:
 ```
 /mcp
@@ -149,8 +144,9 @@ Point at Terminal A. Show a log line:
 *"Every log line is JSON with a trace ID. All lines for one Claude call share the same ID — filter by it in any log aggregator to see exactly what happened."*
 
 ### API key auth
-Restart stack with auth enabled — Ctrl+C in Terminal A, then:
+Restart stack with auth enabled:
 ```bash
+make dev-down
 export MCP_API_KEY=demosecret
 make dev-up-d
 make dev-logs
@@ -277,11 +273,6 @@ make dev-down      # tear it all down
 make prod-up
 ```
 *"Caddy automatically fetches a TLS certificate from Let's Encrypt. HTTPS in one command — no manual cert management."*
-
-### Connect Claude to production
-```bash
-make mcp-add-prod DOMAIN=fraud.yourdomain.com
-```
 
 ### Connect Claude to production
 ```bash
@@ -421,7 +412,7 @@ In Terminal A, every tool call logs a start and end line sharing the same `trace
 | Capability | How shown |
 |------------|-----------|
 | Connection pooling | `db_pool_connections_available` gauge in `/metrics` |
-| Retry on DB failure | `brew services stop` → retry logs → clean error message |
+| Retry on DB failure | `docker stop` DB container → retry logs → clean error message |
 | Structured logging | JSON lines with `trace_id` in Terminal A |
 | Prometheus metrics | `/metrics` before and after tool calls |
 | API key auth | 401 without key, 200 with key, health always exempt |
@@ -430,5 +421,5 @@ In Terminal A, every tool call logs a start and end line sharing the same `trace
 | Materialized view | `get_fraud_summary` instant, `refresh_fraud_summary` background |
 | Background threads | Refresh returns immediately, completion logged seconds later |
 | MCP + Claude | Live fraud detection reasoning over real DB data |
-| Docker | `make build && make up-d` |
+| Docker | `make dev-up-d` — app + postgres + seed data in one command |
 | HTTPS | `make prod-up` — Caddy auto TLS |
