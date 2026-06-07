@@ -9,7 +9,8 @@ install: ## Install Python dependencies into .venv
 	.venv/bin/pip install -r requirements.txt
 
 .PHONY: migrate
-migrate: ## Run all DB migrations
+migrate: ## Run all DB migrations (local postgres)
+	psql -U postgres -d fintechdb -f migrations/000_schema.sql
 	psql -U postgres -d fintechdb -f migrations/001_fraud_summary_mv.sql
 	psql -U postgres -d fintechdb -f migrations/002_readonly_user.sql
 
@@ -42,6 +43,29 @@ down: ## Stop Docker Compose
 .PHONY: logs
 logs: ## Tail logs from the running container
 	docker compose logs -f app
+
+# ── Docker dev (app + bundled postgres, auto-migrated + seeded) ──────────────
+
+.PHONY: dev-up
+dev-up: ## Start app + postgres with seed data (self-contained, no local DB needed)
+	docker compose -f docker-compose.dev.yml up
+
+.PHONY: dev-up-d
+dev-up-d: ## Start dev stack in background
+	docker compose -f docker-compose.dev.yml up -d
+
+.PHONY: dev-down
+dev-down: ## Stop dev stack
+	docker compose -f docker-compose.dev.yml down
+
+.PHONY: dev-logs
+dev-logs: ## Tail dev stack logs
+	docker compose -f docker-compose.dev.yml logs -f
+
+.PHONY: dev-reset
+dev-reset: ## Wipe the DB volume and restart fresh (re-runs all migrations + seed)
+	docker compose -f docker-compose.dev.yml down -v
+	docker compose -f docker-compose.dev.yml up -d
 
 # ── Docker (production, HTTPS) ────────────────────────────────────────────────
 
