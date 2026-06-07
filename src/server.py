@@ -3,9 +3,11 @@ import logging
 import os
 import sys
 import uvicorn
+from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.routing import Mount, Route
 from tracing import get_trace_id
 from app import mcp
 import tools  # noqa: F401 — registers all @mcp.tool() decorators as a side effect
@@ -52,7 +54,6 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-@mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
     from db import _get_pool
     try:
@@ -64,7 +65,6 @@ async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "unhealthy", "db": str(e)}, status_code=503)
 
 
-@mcp.custom_route("/metrics", methods=["GET"])
 async def metrics_endpoint(request: Request) -> Response:
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from db import _pool
@@ -83,7 +83,11 @@ async def metrics_endpoint(request: Request) -> Response:
 if __name__ == "__main__":
     _setup_logging()
     if "--sse" in sys.argv:
-        app = mcp.sse_app()
+        app = Starlette(routes=[
+            Route("/health", health, methods=["GET"]),
+            Route("/metrics", metrics_endpoint, methods=["GET"]),
+            Mount("/", app=mcp.sse_app()),
+        ])
         app.add_middleware(APIKeyMiddleware)
         uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
     else:

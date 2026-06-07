@@ -5,7 +5,7 @@
 -- Refresh with: REFRESH MATERIALIZED VIEW CONCURRENTLY fraud_user_flags;
 -- or call the refresh_fraud_summary MCP tool.
 
-CREATE MATERIALIZED VIEW fraud_user_flags AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS fraud_user_flags AS
 WITH
   indian_cities AS (
     SELECT UNNEST(ARRAY[
@@ -71,4 +71,4 @@ SELECT user_id, 'rapid_fire'::text             AS pattern FROM rapid_users;
 
 -- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY
 -- (concurrent refresh doesn't lock the view for reads)
-CREATE UNIQUE INDEX ON fraud_user_flags (user_id, pattern);
+CREATE UNIQUE INDEX IF NOT EXISTS ON fraud_user_flags (user_id, pattern);
