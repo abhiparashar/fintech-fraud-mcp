@@ -71,4 +71,4 @@ SELECT user_id, 'rapid_fire'::text             AS pattern FROM rapid_users;
 
 -- Required for REFRESH MATERIALIZED VIEW CONCURRENTLY
 -- (concurrent refresh doesn't lock the view for reads)
-CREATE UNIQUE INDEX IF NOT EXISTS ON fraud_user_flags (user_id, pattern);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fraud_user_flags ON fraud_user_flags (user_id, pattern);
