@@ -1,6 +1,6 @@
 # fintech-fraud-mcp
 
-A Python MCP (Model Context Protocol) server that connects Claude to a PostgreSQL transactions database and detects fraud patterns using SQL. Built with production-grade error handling, observability, and security.
+A Python MCP (Model Context Protocol) server that connects Claude to a PostgreSQL transactions database and detects fraud patterns using SQL. Built with production-grade error handling, observability, security, and one-command deployment.
 
 ## What is MCP?
 
@@ -26,61 +26,125 @@ This server exposes 9 tools to Claude over **HTTP/SSE transport**. SSE (Server-S
 
 - Python 3.11+
 - PostgreSQL 16 (`brew install postgresql@16`)
+- Docker (for containerised deployment)
 - Claude Code CLI
 
-## Setup
+## Quick start
 
 ```bash
 # 1. Clone and enter the project
 git clone https://github.com/abhiparashar/fintech-fraud-mcp
 cd fintech-fraud-mcp
 
-# 2. Create a virtual environment with Python 3.11
-python3.11 -m venv .venv
-source .venv/bin/activate
+# 2. Install dependencies
+make install
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Configure environment
+cp .env.example .env
+# Edit .env — set DB_PASSWORD at minimum
 
 # 4. Start PostgreSQL and create the database
 brew services start postgresql@16
 psql -U postgres -c "CREATE DATABASE fintechdb;" 2>/dev/null || true
 
 # 5. Run migrations
-psql -U postgres -d fintechdb -f migrations/001_fraud_summary_mv.sql
-psql -U postgres -d fintechdb -f migrations/002_readonly_user.sql
+make migrate
+
+# 6. Start the server
+make run
+
+# 7. Register with Claude Code and connect
+make mcp-add
+claude
+```
+
+## Makefile — all commands
+
+Run `make help` to see the full list. Key commands:
+
+```bash
+# Local dev
+make install       # create .venv + install dependencies
+make migrate       # run all DB migrations
+make run           # start server locally (HTTP, port 8000)
+make test          # run manual test suite
+
+# Health & observability
+make health        # curl /health with formatted output
+make metrics       # curl /metrics (Prometheus)
+
+# Docker (local, HTTP)
+make build         # build Docker image
+make up            # start with Docker Compose (foreground)
+make up-d          # start with Docker Compose (background)
+make down          # stop
+make logs          # tail container logs
+
+# Production (HTTPS via Caddy)
+make prod-up       # start app + Caddy with auto TLS
+make prod-down     # stop production stack
+make prod-logs     # tail production logs
+
+# Claude Code
+make mcp-add                            # register local server
+make mcp-add-prod DOMAIN=your.domain    # register production server
+make mcp-list                           # list registered MCP servers
+
+# Cleanup
+make clean         # remove .venv and cache files
 ```
 
 ## Environment variables
 
+Copy `.env.example` to `.env` and fill in your values. Never commit `.env`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_NAME` | `fintechdb` | Database name |
+| `DB_USER` | `postgres` | Main DB user |
 | `DB_PASSWORD` | `password` | Main DB user password |
 | `DB_READONLY_USER` | `fraud_reader` | Read-only user for `query_transactions` |
 | `DB_READONLY_PASSWORD` | `readonly_password` | Read-only user password |
 | `MCP_API_KEY` | *(unset)* | When set, enforces `X-API-Key` auth on the SSE endpoint |
 
-Set them before starting the server:
-
-```bash
-export DB_PASSWORD=yourpassword
-export MCP_API_KEY=yoursecretkey   # optional — enables SSE auth
-```
-
 ## Running the server
 
+**Local (no Docker):**
 ```bash
-.venv/bin/python3 src/server.py --sse
+make run
+# server at http://localhost:8000
 ```
 
-The server starts on `http://localhost:8000`. Logs are emitted as structured JSON to stdout.
+**Local (Docker):**
+```bash
+make build
+make up-d
+# server at http://localhost:8000
+```
+
+**Production (Docker + HTTPS):**
+```bash
+# 1. Edit Caddyfile — replace fraud.yourdomain.com with your domain
+# 2. Point your domain's DNS A record to the server IP
+# 3. Fill in .env
+make prod-up
+# server at https://your.domain — TLS cert fetched automatically
+```
 
 ## Connecting to Claude Code
 
-Register the server once:
-
+**Local:**
 ```bash
-claude mcp add --transport sse fintech-fraud-mcp http://localhost:8000/sse
+make mcp-add
+# or manually:
+claude mcp add --transport sse fintech-fraud http://localhost:8000/sse
+```
+
+**Production:**
+```bash
+make mcp-add-prod DOMAIN=fraud.yourdomain.com
 ```
 
 If `MCP_API_KEY` is set, add the header to `~/.claude.json`:
@@ -88,7 +152,7 @@ If `MCP_API_KEY` is set, add the header to `~/.claude.json`:
 ```json
 {
   "mcpServers": {
-    "fintech-fraud-mcp": {
+    "fintech-fraud": {
       "type": "sse",
       "url": "http://localhost:8000/sse",
       "headers": { "X-API-Key": "yoursecretkey" }
@@ -97,7 +161,7 @@ If `MCP_API_KEY` is set, add the header to `~/.claude.json`:
 }
 ```
 
-Then start the server and open Claude Code. Ask things like:
+Then ask Claude things like:
 
 - *"Run get_fraud_summary"*
 - *"Get the profile for user 10"*
@@ -110,7 +174,7 @@ Then start the server and open Claude Code. Ask things like:
 ### Health check
 
 ```bash
-curl http://localhost:8000/health
+make health
 # {"status": "healthy", "db": "connected"}
 # Returns 503 if the database is unreachable
 ```
@@ -118,10 +182,8 @@ curl http://localhost:8000/health
 ### Prometheus metrics
 
 ```bash
-curl http://localhost:8000/metrics
+make metrics
 ```
-
-Exposes:
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -134,7 +196,7 @@ Exposes:
 
 ### Structured logs
 
-Every log line is JSON with a `trace_id` field. All log entries for a single Claude tool call share the same trace ID, so you can correlate exactly what happened during one invocation:
+Every log line is JSON with a `trace_id` field. All log entries for a single Claude tool call share the same trace ID:
 
 ```json
 {"time": "2026-06-07T10:00:01", "level": "INFO", "trace_id": "a3f9c1b2d4e8", "message": "tool=get_fraud_summary trace=a3f9c1b2d4e8 started"}
@@ -155,21 +217,35 @@ src/
 migrations/
   001_fraud_summary_mv.sql  — fraud_user_flags materialized view + unique index
   002_readonly_user.sql     — fraud_reader user with SELECT-only access
+
+Dockerfile              — Production image (non-root user, healthcheck)
+docker-compose.yml      — Local Docker deployment (HTTP)
+docker-compose.prod.yml — Production Docker deployment (app + Caddy HTTPS)
+Caddyfile               — Caddy reverse proxy config (auto TLS via Let's Encrypt)
+Makefile                — All commands in one place
+.env.example            — Environment variable template
+DEMO.md                 — CTO demo runbook with presentation order and test suite
 ```
 
 ## Architecture decisions
 
 **Connection pooling** — `ThreadedConnectionPool(min=2, max=20)` shared across all threads. Opening a new socket per request would exhaust PostgreSQL's connection limit under concurrent load.
 
-**Two pools** — the main pool (postgres user) runs fraud detection queries; a separate readonly pool (fraud_reader) runs `query_transactions`. A restricted user limits blast radius if arbitrary SQL is passed.
+**Two pools** — the main pool (`postgres` user) runs fraud detection queries; a separate readonly pool (`fraud_reader`) runs `query_transactions`. A restricted user limits blast radius if arbitrary SQL is passed.
 
-**Materialized view for `get_fraud_summary`** — the four fraud detectors are heavy self-joins. Instead of running them on every call, `refresh_fraud_summary` pre-computes results into `fraud_user_flags`. `get_fraud_summary` then reads 11 pre-computed rows — instant regardless of table size.
+**Retry with exponential backoff** — Tenacity retries transient `OperationalError` and `PoolError` up to 3 times with exponential backoff (1s, 2s). Transient DB blips are invisible to the user.
 
-**TTLCache for `get_user_profile`** — user spending profiles change infrequently. A 5-minute in-process cache (max 500 users, thread-safe via RLock) eliminates 4 SQL queries per fraud investigation for cached users.
+**Materialized view for `get_fraud_summary`** — the four fraud detectors are heavy self-joins. Instead of running them on every call, `refresh_fraud_summary` pre-computes results into `fraud_user_flags`. `get_fraud_summary` then reads pre-computed rows — instant regardless of table size.
+
+**TTLCache for `get_user_profile`** — user spending profiles change infrequently. A 5-minute in-process cache (max 500 users, thread-safe via RLock) eliminates repeated DB queries for cached users.
 
 **Trace IDs** — Python's `contextvars.ContextVar` binds a new 12-character trace ID at the start of every tool call. The JSON formatter reads it on every log line, so all log entries for one Claude invocation are correlated without passing the ID through every function.
 
 **Auth middleware** — `APIKeyMiddleware` (Starlette `BaseHTTPMiddleware`) checks `X-API-Key` on all routes except `/health` and `/metrics`. Enforcement is a no-op when `MCP_API_KEY` is unset, so local development requires no configuration change.
+
+**HTTPS via Caddy** — Caddy sits in front of uvicorn as a reverse proxy. It automatically obtains and renews TLS certificates from Let's Encrypt. No manual cert management.
+
+**Explicit Starlette routing** — `/health` and `/metrics` are registered as named `Route` entries in a top-level Starlette app, with the MCP SSE app mounted at `/` as a catch-all. This is version-agnostic and does not depend on FastMCP internals.
 
 ## Database schema
 
@@ -191,10 +267,14 @@ fraud_user_flags  (materialized view)
 
 ## Tech stack
 
-- **FastMCP** — Python SDK for the Model Context Protocol
-- **Uvicorn** — ASGI server that runs the SSE endpoint
-- **Starlette** — Web framework: middleware, custom routes, SSE transport
-- **psycopg2** — PostgreSQL driver with `ThreadedConnectionPool`
-- **cachetools** — `TTLCache` with LRU eviction for user profiles
-- **tenacity** — Retry with exponential backoff for transient DB errors
-- **prometheus_client** — Metrics exposition at `/metrics`
+| Library | Purpose |
+|---------|---------|
+| **FastMCP** | Python SDK for the Model Context Protocol |
+| **Uvicorn** | ASGI server that runs the SSE endpoint |
+| **Starlette** | Web framework: middleware, custom routes, SSE transport |
+| **psycopg2** | PostgreSQL driver with `ThreadedConnectionPool` |
+| **cachetools** | `TTLCache` with LRU eviction for user profiles |
+| **tenacity** | Retry with exponential backoff for transient DB errors |
+| **prometheus_client** | Metrics exposition at `/metrics` |
+| **Caddy** | Reverse proxy with automatic TLS (production) |
+| **Docker** | Containerised deployment |
