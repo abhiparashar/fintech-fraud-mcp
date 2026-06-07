@@ -158,8 +158,8 @@ INSERT INTO transactions (user_id, merchant, amount, category, location, ip_addr
 (2, 'Taj Hotels',   6400, 'Travel',        'Delhi',     '10.0.0.2',     '2026-01-15 03:15:00'),
 -- User 6:  avg ~550,  02:45 AM spend = ₹3000  (5.5x average)
 (6, 'Casino Goa',   3000, 'Entertainment', 'Goa',       '172.16.0.6',   '2026-01-15 02:45:00'),
--- User 9:  avg ~680,  03:30 AM spend = ₹2800  (4.1x average)
-(9, 'ITC Hotels',   2800, 'Travel',        'Chennai',   '10.10.0.9',    '2026-01-15 03:30:00'),
+-- User 9:  avg ~680,  03:30 AM spend = ₹4500  (6.6x average)
+(9, 'ITC Hotels',   4500, 'Travel',        'Chennai',   '10.10.0.9',    '2026-01-15 03:30:00'),
 -- User 14: avg ~530,  02:10 AM spend = ₹3300  (6.2x average)
 (14,'Leela Palace', 3300, 'Travel',        'Hyderabad', '172.16.0.14',  '2026-01-15 02:10:00'),
 
