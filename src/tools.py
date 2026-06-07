@@ -1,20 +1,36 @@
+import threading
+import logging
 import psycopg2.extras
+import psycopg2.errors
 from threading import RLock
 from cachetools import TTLCache, cached
 from app import mcp
 from db import (
     get_connection,
+    release_connection,
+    handle_db_errors,
     _fetch_duplicate_rows,
     _fetch_location_anomaly_rows,
     _fetch_late_night_rows,
     _fetch_rapid_fire_rows,
 )
 
+logger = logging.getLogger(__name__)
+
 _profile_cache: TTLCache = TTLCache(maxsize=500, ttl=300)
 _profile_lock = RLock()
 
+# Keywords that must never appear in ad-hoc queries.
+# Even with a SELECT, these can exfiltrate data, sleep the DB, or write files.
+_BLOCKED_KEYWORDS = frozenset({
+    'pg_sleep', 'pg_read_file', 'pg_write_file', 'pg_ls_dir',
+    'pg_stat_file', 'pg_execute_server_program', 'lo_import', 'lo_export',
+    'dblink', 'copy',
+})
+
 
 @mcp.tool()
+@handle_db_errors
 def get_schema() -> str:
     """Get the column names and data types of the transactions table."""
     conn = get_connection()
@@ -33,17 +49,21 @@ def get_schema() -> str:
             )
             return f"transactions table schema:\n\n{result}"
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def query_transactions(sql: str) -> str:
     """
     Run a read-only SELECT query on the transactions table.
     Use this for ad-hoc analysis that other tools don't cover.
     """
-    if not sql.strip().lower().startswith("select"):
+    stripped = sql.strip().lower()
+    if not stripped.startswith("select"):
         return "Error: only SELECT queries are allowed."
+    if any(kw in stripped for kw in _BLOCKED_KEYWORDS):
+        return "Error: query contains a blocked keyword. System functions and file operations are not permitted."
 
     conn = get_connection()
     try:
@@ -54,13 +74,18 @@ def query_transactions(sql: str) -> str:
                 return "No results found."
             result = "\n".join(str(dict(row)) for row in rows)
             return f"Query returned {len(rows)} row(s):\n\n{result}"
-    except Exception as e:
-        return f"Query error: {str(e)}"
+    except psycopg2.errors.QueryCanceled:
+        logger.warning("query_transactions exceeded statement timeout: %.120s", sql)
+        return "Query exceeded the 10-second time limit. Simplify the query or add a LIMIT clause."
+    except psycopg2.Error as e:
+        logger.warning("query_transactions user error [%s]: %s", type(e).__name__, e)
+        return "Query error: invalid SQL or permission denied."
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
     """
     Find duplicate transactions — same user, same amount, same merchant
@@ -86,10 +111,11 @@ def detect_duplicate_transactions(threshold_seconds: int = 60) -> str:
                 )
             return f"Found {len(rows)} duplicate pair(s):\n\n" + "\n".join(result)
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def detect_location_anomalies(threshold_minutes: int = 30) -> str:
     """
     Find impossible location changes — same user appearing in an Indian city
@@ -114,10 +140,11 @@ def detect_location_anomalies(threshold_minutes: int = 30) -> str:
                 )
             return f"Found {len(rows)} impossible location change(s):\n\n" + "\n".join(result)
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def detect_late_night_large_transactions(
     start_hour: int = 2,
     end_hour: int = 4,
@@ -144,10 +171,11 @@ def detect_late_night_large_transactions(
                 )
             return f"Found {len(rows)} suspicious late night transaction(s):\n\n" + "\n".join(result)
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def detect_rapid_fire_transactions(
     window_seconds: int = 90,
     min_txn_count: int = 5
@@ -175,10 +203,11 @@ def detect_rapid_fire_transactions(
                 )
             return f"Found {len(rows)} user(s) with rapid fire bursts:\n\n" + "\n".join(result)
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 @cached(cache=_profile_cache, lock=_profile_lock)
 def get_user_profile(user_id: int) -> str:
     """
@@ -272,10 +301,11 @@ def get_user_profile(user_id: int) -> str:
                 f"Most active hours  : {hours_breakdown}"
             )
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def get_fraud_summary() -> str:
     """
     Return a pre-computed fraud summary from the fraud_user_flags materialized view.
@@ -340,26 +370,31 @@ def get_fraud_summary() -> str:
             report.append("  None found.")
 
         return "\n".join(report)
-    except Exception as e:
-        if 'fraud_user_flags' in str(e):
-            return "Materialized view not found. Run: psql -U postgres -d fintechdb -f migrations/001_fraud_summary_mv.sql"
-        raise
+    except psycopg2.errors.UndefinedTable:
+        return "Materialized view not found. Run: psql -U postgres -d fintechdb -f migrations/001_fraud_summary_mv.sql"
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @mcp.tool()
+@handle_db_errors
 def refresh_fraud_summary() -> str:
     """
-    Refresh the fraud_user_flags materialized view with the latest transaction data.
-    This re-runs all 4 fraud detection queries and stores the results.
-    Call this after new transactions are added, then call get_fraud_summary to read results.
+    Refresh the fraud_user_flags materialized view in the background.
+    Returns immediately. Results are available in ~30 seconds via get_fraud_summary.
+    Call this after new transactions are added to pick up fresh fraud signals.
     """
-    conn = get_connection()
-    conn.autocommit = True
-    try:
-        with conn.cursor() as cur:
-            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fraud_user_flags")
-        return "Refreshed. Call get_fraud_summary to see updated results."
-    finally:
-        conn.close()
+    def _do_refresh() -> None:
+        conn = get_connection()
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fraud_user_flags")
+            logger.info("fraud_user_flags refresh completed")
+        except Exception:
+            logger.exception("fraud_user_flags refresh failed")
+        finally:
+            release_connection(conn)
+
+    threading.Thread(target=_do_refresh, daemon=True).start()
+    return "Fraud summary refresh started in background. Call get_fraud_summary in ~30 seconds."

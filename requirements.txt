@@ -2,3 +2,4 @@ mcp
 psycopg2-binary
 uvicorn
 cachetools
+tenacity

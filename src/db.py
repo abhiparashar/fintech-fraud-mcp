@@ -1,12 +1,23 @@
+import os
+import functools
+import logging
+import threading
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
+import psycopg2.extensions
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+logger = logging.getLogger(__name__)
 
 DB_CONFIG = {
     "host": "localhost",
     "port": 5432,
     "database": "fintechdb",
     "user": "postgres",
-    "password": "password",
+    "password": os.environ.get("DB_PASSWORD", "password"),
+    "connect_timeout": 5,                       # fail fast if DB is unreachable
+    "options": "-c statement_timeout=10000",    # kill any query that runs over 10s
 }
 
 INDIAN_CITIES = (
@@ -15,10 +26,74 @@ INDIAN_CITIES = (
     'Jaipur', 'Surat', 'Lucknow', 'Kanpur'
 )
 
+# ── connection pool ───────────────────────────────────────────────────────────
+# One pool shared across all threads. Lazy-init with double-checked locking
+# so the server starts even if Postgres is temporarily unavailable.
 
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
 
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2, maxconn=20, **DB_CONFIG
+                )
+                logger.info("DB connection pool initialized (min=2, max=20)")
+    return _pool
+
+
+@retry(
+    retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.pool.PoolError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    reraise=True,
+    before_sleep=lambda rs: logger.warning(
+        "DB connection attempt %d failed, retrying...", rs.attempt_number
+    ),
+)
+def get_connection() -> psycopg2.extensions.connection:
+    return _get_pool().getconn()
+
+
+def release_connection(conn: psycopg2.extensions.connection) -> None:
+    """Return a connection to the pool. Rolls back dirty state and resets autocommit."""
+    if not (_pool and conn):
+        return
+    try:
+        if conn.status != psycopg2.extensions.STATUS_READY:
+            conn.rollback()
+        conn.autocommit = False  # reset in case caller set it (e.g. refresh_fraud_summary)
+    except Exception:
+        pass
+    _pool.putconn(conn)
+
+
+# ── error handler decorator ───────────────────────────────────────────────────
+# Applied to every MCP tool. Catches psycopg2 errors, logs the real cause
+# internally, and returns a clean message to Claude with no internal details.
+
+def handle_db_errors(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except psycopg2.OperationalError as e:
+            logger.error("DB unavailable in %s: %s", fn.__name__, e)
+            return "Database temporarily unavailable. Please try again in a moment."
+        except psycopg2.Error as e:
+            logger.error("DB error in %s [%s]: %s", fn.__name__, type(e).__name__, e)
+            return "A database error occurred. Check server logs for details."
+        except Exception:
+            logger.exception("Unexpected error in %s", fn.__name__)
+            return "An unexpected error occurred. Check server logs."
+    return wrapper
+
+
+# ── private query helpers ─────────────────────────────────────────────────────
 
 def _fetch_duplicate_rows(cur, threshold_seconds: int = 60):
     cur.execute("""
